@@ -3,11 +3,11 @@
   "out_path": "data/batch_001.jsonl",
   "models": [
     {
-      "model_id": "meta.llama-3.3-70b-instruct",
+      "model_id": "meta.llama-4-maverick-17b-128e-instruct-fp8",
       "weight": 3
     },
     {
-      "model_id": "cohere.command-r-08-2024",
+      "model_id": "meta.llama-4-scout-17b-16e-instruct",
       "weight": 1
     }
   ],

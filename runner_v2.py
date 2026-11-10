@@ -25,8 +25,26 @@ Fixes from the independent PR #1 reviews (DeepSeek 2235/2236, Claude 2238/2241) 
  13 the client is built and interface-checked outside the try, before the reservation
     row: misconfiguration raises, the ledger never books an attempt that never ran;
  14 main() fails fast when attempt_char_cap is absent from the config (DeepSeek F6).
- Still open by the lead's call (DeepSeek 2235): F1 record writer, F5 OCI adapter,
-    F6 badjson-as-made, F7 retry policy.
+ 15 F1, writer restored from generate.py (Instinct 2245 ask): run_once returns the
+    reply; main() parses it, writes the record (generate.py's shape: id, instruction,
+    response, source, generator, created_utc) to out_path with flush per record and
+    seeds_done checkpointing, so a restart does not re-bill completed pairs;
+ 16 F5, adapter restored: OciAdapter.generate(model_id, prompt, cfg) wraps the
+    client call shape generate.py uses (cohere rides chat(), llama rides
+    generate_text(), text extracted from .data), so the real OCI path is callable;
+ 17 F6, parse-and-filter between completed and made (Claude 2238 #6): an unparseable
+    or too-short reply closes its attempt as "unparseable" (last row per attempt_id
+    wins in effective_rows()) and never counts as a made pair;
+ 18 N6 (Claude 2235): a config without max_tokens fails fast in main() instead of
+    silently bringing back the prompt-only charge.
+ Units: every recorded char count is UTF-8 BYTES (the reservation must be
+ conservative); whether Oracle bills bytes or code points is still unverified and
+ rides stage-1 reconciliation against Oracle's usage view. An unknown, timed-out,
+ killed or unparseable attempt keeps its FULL reservation until that independent
+ reconciliation; it is never released on timeout (Instinct 2246 item 3).
+ Still open: F7 retry policy (generate.py's; the runner makes no retries of its
+ own), a cross-process ledger lock (DeepSeek 2137 spend_cap flock; the runner is
+ single-writer-safe only), pending-row recovery for a killed worker (lead's call).
 """
 import argparse, hashlib, json, os, sys, time, uuid
 from datetime import datetime, timezone
@@ -66,14 +84,12 @@ class Ledger:
         except FileNotFoundError:
             return []
     def effective_rows(self):
-        """One row per attempt: the closing row when it exists, else the pending
-        reservation. Reservations and closes share attempt_id by design."""
+        """One row per attempt: the LAST row written for that attempt_id wins.
+        Reservations and closes share attempt_id by design, and a later close
+        (for example completed then unparseable) supersedes the earlier one."""
         best = {}
         for r in self.rows():
-            aid = r["attempt_id"]
-            cur = best.get(aid)
-            if cur is None or (cur["status"] == "pending" and r["status"] != "pending"):
-                best[aid] = r
+            best[r["attempt_id"]] = r
         return list(best.values())
     def spent_chars(self):
         # unknown/pending/failed/timeout all count: a call may be billable though
@@ -83,10 +99,13 @@ class Ledger:
     def attempts(self):
         return len(self.effective_rows())
 
-def record_chars(text):  # exact count of billed characters, prompt+response
-    # A byte-billed service counts UTF-8 bytes; in Thai/Arabic/Indonesian seeds
-    # one code point is 2-3 bytes, so len() under-reserves the input term by up
-    # to 3x. Read as bytes; the reply term is separately bounded by 113 x max_tokens.
+def record_chars(text):
+    """Recorded char counts are UTF-8 BYTES. The reservation must be conservative,
+    so bytes it is: in Thai/Arabic/Indonesian seeds one code point is 2-3 bytes,
+    and len() under-reserves the input term by up to 3x. The reply term is
+    separately bounded by 113 x max_tokens. If Oracle bills code points, stage-1
+    reconciliation against its usage view settles it; until then bytes only
+    over-reserve, never under-reserve."""
     return len(text.encode("utf-8"))
 
 def run_once(cfg, client_factory, seed, model_id, prompt, ledger, max_out_chars=None):
@@ -109,6 +128,7 @@ def run_once(cfg, client_factory, seed, model_id, prompt, ledger, max_out_chars=
     # (committed = settled if settled else reserved)
     a.output_chars = max_out_chars or 0
     ledger.append(a)                       # reservation BEFORE the call
+    reply = None
     try:
         reply, usage = client.generate(model_id, prompt, cfg)
         a.output_chars = record_chars(reply)
@@ -120,7 +140,17 @@ def run_once(cfg, client_factory, seed, model_id, prompt, ledger, max_out_chars=
         # response may or may not have been billable: unknown, counted as spent
         a.status = "unknown"; a.ended_utc = now(); a.error = str(e)[:200]
     ledger.append(a)                       # closing row (supersedes pending)
-    return a
+    return a, reply
+
+def close_attempt(ledger, a, status, error):
+    """F6 close: supersede a completed attempt with an unparseable one (same
+    attempt_id, last row wins). The reply's byte count is known, so the settled
+    output term stays; the pair itself never counts as made."""
+    c = Attempt(a["run_id"], a["seed_id"], a["model"])
+    c.attempt_id = a["attempt_id"]
+    c.input_chars = a["input_chars"]; c.output_chars = a["output_chars"]
+    c.usage = a["usage"]; c.status = status; c.error = error; c.ended_utc = now()
+    ledger.append(c)
 
 class StubClient:
     """No key, no network. Scripted behaviors per call, from a test script."""
@@ -144,12 +174,68 @@ class StubClient:
             return "here is prose, no json at all", None
         raise ValueError("bad stub action")
 
-def build_client(cfg):  # real path (stage 1+): region from config, validated on first call
-    import oci
-    conf = oci.config.from_file(profile_name=cfg.get("profile", "DEFAULT"))
-    client = oci.generative_ai_inference.GenerativeAiInferenceClient(conf,
-        service_endpoint=f"https://inference.generativeai.{cfg['region']}.oci.oraclecloud.com")
-    return client
+def parse_pair(text):
+    """generate.py's parse: first JSON object in the reply, both fields non-empty."""
+    import re
+    m = re.search(r"\{", text)
+    if not m:
+        raise ValueError("no JSON object in reply")
+    obj, _ = json.JSONDecoder().raw_decode(text[m.start():])
+    if not (isinstance(obj, dict) and str(obj.get("instruction", "")).strip()
+            and str(obj.get("response", "")).strip()):
+        raise ValueError("bad pair shape")
+    return str(obj["instruction"]).strip(), str(obj["response"]).strip()
+
+class OciAdapter:
+    """The adapter Claude 2238 finding 5 asked for: .generate(model_id, prompt, cfg)
+    on top of the real client call shape generate.py uses. Cohere rides chat(),
+    llama rides generate_text(), text extracted from .data. The oci import stays
+    lazy so the stub path never needs the package."""
+    def __init__(self, cfg):
+        import oci
+        conf = oci.config.from_file(profile_name=cfg.get("profile", "DEFAULT"))
+        self.client = oci.generative_ai_inference.GenerativeAiInferenceClient(conf,
+            service_endpoint=f"https://inference.generativeai.{cfg['region']}.oci.oraclecloud.com")
+        self.cfg = cfg
+    class Throttled(Exception):
+        pass
+    def _extract_text(self, data):
+        found = []
+        def walk(d):
+            if isinstance(d, str):
+                found.append(d)
+            elif isinstance(d, dict):
+                for v in d.values(): walk(v)
+            elif isinstance(d, list):
+                for v in d: walk(v)
+        walk(data.to_dict() if hasattr(data, "to_dict") else data)
+        if not found:
+            raise RuntimeError("no text found in reply")
+        return max(found, key=len)
+    def generate(self, model_id, prompt, cfg):
+        import oci
+        if model_id.startswith("cohere"):
+            detail = oci.generative_ai_inference.models.ChatDetails()
+            detail.serving_mode = oci.generative_ai_inference.models.OnDemandServingMode(model_id=model_id)
+            detail.chat_request = oci.generative_ai_inference.models.CohereChatRequest(
+                message=prompt, max_tokens=cfg["max_tokens"], temperature=cfg["temperature"])
+        else:
+            detail = oci.generative_ai_inference.models.GenerateTextDetails()
+            detail.serving_mode = oci.generative_ai_inference.models.OnDemandServingMode(model_id=model_id)
+            detail.inference_request = oci.generative_ai_inference.models.LlamaLlmInferenceRequest(
+                prompt=prompt, max_tokens=cfg["max_tokens"], temperature=cfg["temperature"])
+        detail.compartment_id = cfg["compartment_id"]
+        try:
+            if model_id.startswith("cohere"):
+                return self._extract_text(self.client.chat(detail).data), None
+            return self._extract_text(self.client.generate_text(detail).data), None
+        except oci.exceptions.ServiceError as e:
+            if e.status == 429:
+                raise OciAdapter.Throttled(str(e))
+            raise
+
+def build_client(cfg):  # real path (stage 1+): region from config, adapter restores .generate
+    return OciAdapter(cfg)
 
 def pick_model(cfg, seed_id, ledger_rows):
     allowed = {m["model_id"] for m in cfg["models"]}
@@ -200,13 +286,21 @@ def main():
     # Bound the reply term before the call: the longest Llama-4 token decodes to
     # 113 characters (DeepSeek 2137), so a reply of max_tokens tokens is at most
     # 113 x max_tokens characters.
-    max_out_chars = cfg.get("max_chars_per_token", 113) * cfg["max_tokens"] if cfg.get("max_tokens") else None
+    if not cfg.get("max_tokens"):
+        sys.exit("config needs max_tokens: without it no reply term can be reserved, and the "
+                 "attempt would silently carry only its prompt charge (Claude 2235 N6)")
+    max_out_chars = cfg.get("max_chars_per_token", 113) * cfg["max_tokens"]
     if not cfg.get("attempt_char_cap"):
         sys.exit("config needs attempt_char_cap: the per-attempt reservation ceiling in "
-                 "chars, at least input bytes + 113 x max_tokens (116,712 at 1,024 tokens)")
+                 "chars, at least input bytes + the reply term (113 x max_tokens = 115,712 "
+                 "bytes at 1,024 tokens; about 116,712 with a 1,000-byte prompt)")
+    os.makedirs(os.path.dirname(cfg["out_path"]) or ".", exist_ok=True)
     seeds_done = load_seed_ids(cfg["out_path"])
+    n_max = args.limit if args.limit else 10**9
     made = 0
     for seed in cfg_seeds(cfg):
+        if made >= n_max:
+            break
         for k in range(seed.get("n_pairs", cfg.get("pairs_per_seed", 4))):
             # Rows are keyed by the bare seed id, and a closing row supersedes its
             # reservation: effective_rows(), not rows(), or the pending row wins.
@@ -220,12 +314,43 @@ def main():
             if ledger.spent_chars() + cfg["attempt_char_cap"] > budget_chars:
                 break
             prompt = f"prompt for {seed['topic']} (pair {k+1})"
-            a = run_once(cfg, lambda: build_client(cfg), seed, model_id, prompt, ledger,
-                         max_out_chars=max_out_chars)
-            if a and a.status == "completed":
-                made += 1
+            a, reply = run_once(cfg, lambda: build_client(cfg), seed, model_id, prompt, ledger,
+                                max_out_chars=max_out_chars)
+            if a is None or reply is None or a.status != "completed":
+                continue
+            # F6 parse-and-filter (Claude 2238 #6): a pair counts as MADE only when it
+            # parses and clears the length floor. An unparseable or too-short reply
+            # closes its attempt as "unparseable" and inflates nothing.
+            try:
+                instr, resp = parse_pair(reply)
+            except (ValueError, json.JSONDecodeError) as e:
+                close_attempt(ledger, a.row(), "unparseable", f"parse: {e}")
+                continue
+            if len(instr.encode("utf-8")) < 15 or len(resp.encode("utf-8")) < 15:
+                close_attempt(ledger, a.row(), "unparseable", "below 15-byte floor")
+                continue
+            rec = {
+                "id": rec_id,
+                "instruction": instr,
+                "response": resp,
+                "source": "synthetic",
+                "generator": {
+                    "model": model_id,
+                    "template": cfg.get("template", "pair-from-topic-v1"),
+                    "temperature": cfg["temperature"],
+                    "max_tokens": cfg["max_tokens"],
+                },
+                "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            with open(cfg["out_path"], "a", encoding="utf-8") as out:
+                out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                out.flush()
+            seeds_done.add(rec_id)
+            made += 1
+    note = "" if ledger.attempts() else (" (no attempts booked: seeds empty, budget "
+                                         "exhausted, or cap already reached)")
     print(f"done: run {cfg['run_id']} made {made} pairs; ledger {ledger.attempts()} attempts, "
-          f"{ledger.spent_chars()} chars, est ${ledger.spent_chars()/1e6*price:.2f}")
+          f"{ledger.spent_chars()} chars, est ${ledger.spent_chars()/1e6*price:.2f}{note}")
 
 def cfg_seeds(cfg):
     return [json.loads(l) for l in open(cfg["seeds_path"]) if l.strip() and not l.startswith("#")]
