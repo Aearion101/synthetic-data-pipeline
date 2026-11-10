@@ -41,6 +41,24 @@ creates new accounts or keys.
   stopping at the configured budget.
 - Rate-limit friendly: paces calls at `requests_per_minute` and backs off hard on 429s.
 - Dedupe: `dedupe.py` drops exact and near-exact duplicates before anything eats the data.
+- Source-script scan after generation: `scan_offlist.py` (Instinct 0545 ruling on
+  Claude 0535) runs BEFORE any pair enters a tune. The pack's quoted-source wrapper
+  line sits on all rows, including non-translation rows where the model writes the
+  source passage itself, so prompt-time flags cannot see an off-list quotation there.
+  It joins each pair id to its pack row by the base id before the first `#`, skips
+  rows whose language is zh/ja/ko/ru (an off-list passage is expected there), and
+  reports Han/Kana/Hangul/Cyrillic hits on every other language, Polish included
+  (Latin script; its native-speaker QC in the pack README stays separate). A hit is
+  a decision input with counts, not a defect verdict: the wrapper line makes
+  off-list quoting legal on any row. Usage: `python3 scan_offlist.py --pairs
+  data/batch_001.jsonl --pack pack/v2.1/bulk_prompts_v2.1.onestage.train.jsonl`
+  (offline, no key, no model call; `--fail-on-hit` exits 1 on findings). Coverage
+  limit: only those four script ranges, so an off-list Latin-script source (Polish
+  or any other) quoted inside a non-pl row is not visible to it. Tests: T33.
+
+Note: `pack/v2.1/README.md` is the producer's file, checked in byte-identical to its
+Dropbox original (Instinct 0446/0447), so this limit note lives here and in
+`scan_offlist.py`'s docstring rather than inside that file.
 
 Cost math: at $0.18/M characters, $300 buys roughly 1.6 billion characters, several
 hundred million tokens of output. Embeddings run about 10x cheaper.
