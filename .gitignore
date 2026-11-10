@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+data/
+gen_config.json
+seeds.jsonl
+.oci/

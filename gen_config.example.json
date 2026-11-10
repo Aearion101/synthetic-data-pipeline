@@ -1,0 +1,19 @@
+{
+  "seeds_path": "seeds.jsonl",
+  "out_path": "data/batch_001.jsonl",
+  "models": [
+    {"model_id": "meta.llama-3.3-70b-instruct", "weight": 3},
+    {"model_id": "cohere.command-r-08-2024", "weight": 1}
+  ],
+  "template": "pair-from-topic-v1",
+  "temperature": 0.8,
+  "max_tokens": 1024,
+  "pairs_per_seed": 4,
+  "requests_per_minute": 12,
+  "budget_usd": 300.0,
+  "price_per_million_chars": 0.18,
+  "max_retries": 4,
+  "region": "us-ashburn-1",
+  "compartment_id": "SET_ME",
+  "profile": "DEFAULT"
+}

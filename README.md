@@ -1,0 +1,53 @@
+# synthetic-data-pipeline
+
+Synthetic instruction-pair generation on Oracle Cloud Generative AI (hosted, on-demand),
+paid from the $300 promo credits (expire Nov 15, 2026). The output is model-neutral: plain
+JSONL instruction pairs, no chat template baked in, languages whatever the seed corpus
+says. Format conversion happens at tune time, not at generation.
+
+## Quickstart
+
+    pip install oci
+    cp gen_config.example.json gen_config.json   # set compartment_id
+    # seeds.jsonl: one {"id","topic"} per line; see seeds.example.jsonl
+    python3 generate.py --config gen_config.json --dry-run
+    python3 generate.py --config gen_config.json
+    python3 dedupe.py data/batch_001.jsonl data/batch_001.clean.jsonl
+
+Auth is the standard OCI SDK path (~/.oci/config, OCI_CLI_* env vars, or instance
+principals). Execution is gated on Dylan handing the OCI keys via secure link; nobody
+creates new accounts or keys.
+
+## What the script does
+
+- One call per training pair: a prompt template turns a seed topic into one
+  instruction/response pair, and the reply is parsed, validated, and appended to the JSONL.
+- Model-neutral records: `{"id", "instruction", "response", "source", "generator",
+  "created_utc"}`, with the model id, template, temperature, and timestamp on every record
+  so provenance stays clean end to end.
+- Resumable: a rerun skips pair ids already in the output file, so an interrupted batch
+  continues instead of duplicating.
+- Budget-aware: counts sent + received characters and prices them against the config rate
+  (cheap Llama is about $0.18 per million characters), printing a running estimate and
+  stopping at the configured budget.
+- Rate-limit friendly: paces calls at `requests_per_minute` and backs off hard on 429s.
+- Dedupe: `dedupe.py` drops exact and near-exact duplicates before anything eats the data.
+
+Cost math: at $0.18/M characters, $300 buys roughly 1.6 billion characters, several
+hundred million tokens of output. Embeddings run about 10x cheaper.
+
+## License and provenance notes
+
+- Oracle AI Terms (rev 2026-09-16): outputs may train other AI systems; you own your
+  output. The remaining line is not attempting to reconstruct the models' training data.
+- Third-party terms stack on top: Cohere is clean for the planned open release; Llama data
+  is fine but a public tune built on Llama-generated outputs carries "Llama" in its name;
+  Grok stays out of this pipeline (xAI terms bar helping rivals).
+- No HPE work data goes through the account, ever (company policy).
+- GPU compute is blocked on this account for 90 days, so everything here rides hosted
+  inference.
+
+## Storage plan
+
+Working copy in S3, mirror copy in Google Drive, mirror after each batch so a bad push
+cannot lose a day of work; GitHub carries the set only when it is ready to release.
