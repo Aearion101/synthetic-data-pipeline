@@ -684,13 +684,44 @@ def suite():
                          "off_list_source_language": False,
                          "llama4_pair_fully_documented": False})
           == "llama4-pair-not-fully-documented")
-    # and main()'s gate orders status before hold: a pending row is counted as
-    # pending_user_approval, not by its hold reason.
-    import types
-    check("T32 hold_reason does not fire on a pending row's own status field",
+    # hold_reason reads the pack flags only: it ignores execution_status, so a
+    # held row stays held whatever its status says (main()'s gate orders status
+    # before hold, so a PENDING row is still counted as pending_user_approval
+    # first; the fixture demo shows that ordering).
+    check("T32 hold_reason ignores execution_status: a held row stays held whatever its status says",
           R.hold_reason({"execution_status": "pending_user_approval",
                          "support": {"llama4_documented": False}})
           == "llama4-undocumented-language")
+
+    # T33 (Instinct 0545 ruling on Claude 0535): the post-generation
+    # source-script scan in scan_offlist.py. It runs BEFORE a tune, not inside
+    # the runner: a generated pair's instruction is scanned for Han, Kana,
+    # Hangul or Cyrillic on rows whose pack language is NOT zh/ja/ko/ru. The
+    # wrapper line makes off-list quoting legal on any row, so a hit is a
+    # decision input with counts, not a defect verdict on its own.
+    import scan_offlist as S
+    check("T33 zh row: a Han passage is expected there, not a finding",
+          S.scan_pairs_lines([{"id": "r#1#m", "language": "zh", "instruction": "wind \u4e2d rain"}],
+                             {"r": "zh"}) == ([], []))
+    check("T33 en row with a Hangul passage: reported with its script",
+          S.scan_pairs_lines([{"id": "r#1#m", "language": "en", "instruction": "learn \ud55c\uad6d\uc5b4 today"}],
+                             {"r": "en"})[0][0]["scripts"].keys() == {"Hangul"})
+    check("T33 id row with a Kana passage: reported",
+          S.scan_pairs_lines([{"id": "r#1#m", "language": "id", "instruction": "kata \u307e\u3059 inside"}],
+                             {"r": "id"})[0][0]["scripts"].keys() == {"Kana"})
+    check("T33 ru row with Cyrillic: skipped, it is an off-list language",
+          S.scan_pairs_lines([{"id": "r#1#m", "language": "ru", "instruction": "\u0434\u043e\u043c"}],
+                             {"r": "ru"}) == ([], []))
+    check("T33 plain en row: no finding",
+          S.scan_pairs_lines([{"id": "r#1#m", "language": "en", "instruction": "write a haiku about rain"}],
+                             {"r": "en"}) == ([], []))
+    check("T33 pl row with a Han hit: still scanned (Polish is Latin script; QC is separate)",
+          S.scan_pairs_lines([{"id": "r#1#m", "language": "pl", "instruction": "\u6f22\u5b57"}],
+                             {"r": "pl"})[0][0]["scripts"].keys() == {"Han"})
+    check("T33 base id join: spv2-00003#1#model maps through base spv2-00003",
+          S.base_id("spv2-00003#1#alpha.model") == "spv2-00003")
+    check("T33 unknown id with no language field: listed as unmapped, not guessed",
+          S.scan_pairs_lines([{"id": "ghost#1#m", "instruction": "\u4e2d"}], {})[1][0]["id"] == "ghost#1#m")
 
 def worker(cfg, n, q):
     """Same five seeds from two workers. Config arrives as an argument so the
