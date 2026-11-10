@@ -1,3 +1,100 @@
-{"id": "seed-00001", "topic": "How DNS resolution walks from root servers down to an authoritative answer, and what a cached negative answer is"}
-{"id": "seed-00002", "topic": "Common failure modes of home Wi-Fi mesh systems and how to diagnose which node is dropping"}
-{"id": "seed-00003", "topic": "What a small business should put in its first data-retention policy, and why it matters even with no legal requirement"}
+{"id": "seed-00001", "topic": "why bread dough needs kneading", "lang": "en", "domain": "cooking"}
+{"id": "seed-00002", "topic": "searing meat properly", "lang": "en", "domain": "cooking"}
+{"id": "seed-00003", "topic": "making stock from scraps", "lang": "en", "domain": "cooking"}
+{"id": "seed-00004", "topic": "cooking rice without it going sticky or burnt", "lang": "en", "domain": "cooking"}
+{"id": "seed-00005", "topic": "knife skills for vegetables", "lang": "en", "domain": "cooking"}
+{"id": "seed-00006", "topic": "what acid does to a dish and how to use it", "lang": "en", "domain": "cooking"}
+{"id": "seed-00007", "topic": "fermenting vegetables safely at home", "lang": "en", "domain": "cooking"}
+{"id": "seed-00008", "topic": "substituting ingredients when baking", "lang": "en", "domain": "cooking"}
+{"id": "seed-00009", "topic": "grilling over charcoal vs gas", "lang": "en", "domain": "cooking"}
+{"id": "seed-00010", "topic": "storing herbs so they last weeks", "lang": "en", "domain": "cooking"}
+{"id": "seed-00011", "topic": "debouncing a mechanical switch in firmware", "lang": "en", "domain": "embedded"}
+{"id": "seed-00012", "topic": "reading a datasheet timing diagram", "lang": "en", "domain": "embedded"}
+{"id": "seed-00013", "topic": "choosing between I2C, SPI and UART", "lang": "en", "domain": "embedded"}
+{"id": "seed-00014", "topic": "power budgeting a battery sensor node", "lang": "en", "domain": "embedded"}
+{"id": "seed-00015", "topic": "why brownout detection matters", "lang": "en", "domain": "embedded"}
+{"id": "seed-00016", "topic": "interrupt priorities and pitfalls", "lang": "en", "domain": "embedded"}
+{"id": "seed-00017", "topic": "using an ADC properly (reference, sampling, noise)", "lang": "en", "domain": "embedded"}
+{"id": "seed-00018", "topic": "bootloaders and firmware updates", "lang": "en", "domain": "embedded"}
+{"id": "seed-00019", "topic": "watchdog timers done right", "lang": "en", "domain": "embedded"}
+{"id": "seed-00020", "topic": "driving an LED matrix without flicker", "lang": "en", "domain": "embedded"}
+{"id": "seed-00021", "topic": "planning a week of meals around leftovers", "lang": "en", "domain": "everyday-reasoning"}
+{"id": "seed-00022", "topic": "how to compare two job offers fairly", "lang": "en", "domain": "everyday-reasoning"}
+{"id": "seed-00023", "topic": "deciding whether to repair or replace an appliance", "lang": "en", "domain": "everyday-reasoning"}
+{"id": "seed-00024", "topic": "packing for a two-week trip in one bag", "lang": "en", "domain": "everyday-reasoning"}
+{"id": "seed-00025", "topic": "organizing a small move across town", "lang": "en", "domain": "everyday-reasoning"}
+{"id": "seed-00026", "topic": "dispute a wrong charge on a bill effectively", "lang": "en", "domain": "everyday-reasoning"}
+{"id": "seed-00027", "topic": "choosing between renting and buying tools", "lang": "en", "domain": "everyday-reasoning"}
+{"id": "seed-00028", "topic": "splitting shared household costs fairly", "lang": "en", "domain": "everyday-reasoning"}
+{"id": "seed-00029", "topic": "learning a new skill with 30 minutes a day", "lang": "en", "domain": "everyday-reasoning"}
+{"id": "seed-00030", "topic": "giving useful feedback on a friend's writing", "lang": "en", "domain": "everyday-reasoning"}
+{"id": "seed-00031", "topic": "compound interest with a worked example", "lang": "en", "domain": "finance-basics"}
+{"id": "seed-00032", "topic": "what an emergency fund is for", "lang": "en", "domain": "finance-basics"}
+{"id": "seed-00033", "topic": "reading a payslip's deductions", "lang": "en", "domain": "finance-basics"}
+{"id": "seed-00034", "topic": "how credit interest is calculated", "lang": "en", "domain": "finance-basics"}
+{"id": "seed-00035", "topic": "fixed vs variable rate loans", "lang": "en", "domain": "finance-basics"}
+{"id": "seed-00036", "topic": "what inflation does to savings", "lang": "en", "domain": "finance-basics"}
+{"id": "seed-00037", "topic": "how a budget is actually built and kept", "lang": "en", "domain": "finance-basics"}
+{"id": "seed-00038", "topic": "insurance deductibles explained", "lang": "en", "domain": "finance-basics"}
+{"id": "seed-00039", "topic": "currency exchange spreads and fees", "lang": "en", "domain": "finance-basics"}
+{"id": "seed-00040", "topic": "why diversification matters", "lang": "en", "domain": "finance-basics"}
+{"id": "seed-00041", "topic": "how to descale a coffee maker", "lang": "en", "domain": "home"}
+{"id": "seed-00042", "topic": "fixing a dripping faucet", "lang": "en", "domain": "home"}
+{"id": "seed-00043", "topic": "choosing insulation for an attic", "lang": "en", "domain": "home"}
+{"id": "seed-00044", "topic": "bleeding radiators in a hydronic heating system", "lang": "en", "domain": "home"}
+{"id": "seed-00045", "topic": "painting a room properly (prep to cleanup)", "lang": "en", "domain": "home"}
+{"id": "seed-00046", "topic": "unclogging a slow bathroom drain", "lang": "en", "domain": "home"}
+{"id": "seed-00047", "topic": "when to replace vs sharpen kitchen knives", "lang": "en", "domain": "home"}
+{"id": "seed-00048", "topic": "weatherproofing a drafty front door", "lang": "en", "domain": "home"}
+{"id": "seed-00049", "topic": "maintaining a lawn mower for the season", "lang": "en", "domain": "home"}
+{"id": "seed-00050", "topic": "hanging heavy shelves into drywall without studs", "lang": "en", "domain": "home"}
+{"id": "seed-00051", "topic": "common Bahasa Indonesia greetings and when to use them", "lang": "en", "domain": "indonesia"}
+{"id": "seed-00052", "topic": "how to use 'anda' vs 'kamu' politely", "lang": "en", "domain": "indonesia"}
+{"id": "seed-00053", "topic": "what gotong royong means in practice", "lang": "en", "domain": "indonesia"}
+{"id": "seed-00054", "topic": "navigating Indonesian markets politely", "lang": "en", "domain": "indonesia"}
+{"id": "seed-00055", "topic": "Indonesian public holidays and what closes", "lang": "en", "domain": "indonesia"}
+{"id": "seed-00056", "topic": "using ride-hailing apps in Indonesian cities", "lang": "en", "domain": "indonesia"}
+{"id": "seed-00057", "topic": "basic Bahasa Indonesia numbers and bargaining", "lang": "en", "domain": "indonesia"}
+{"id": "seed-00058", "topic": "eating etiquette in Indonesia", "lang": "en", "domain": "indonesia"}
+{"id": "seed-00059", "topic": "how to address elders respectfully in Indonesia", "lang": "en", "domain": "indonesia"}
+{"id": "seed-00060", "topic": "Indonesian street food safety basics", "lang": "en", "domain": "indonesia"}
+{"id": "seed-00061", "topic": "subnetting a /24 for three teams", "lang": "en", "domain": "networking"}
+{"id": "seed-00062", "topic": "what MTU mismatch does to traffic", "lang": "en", "domain": "networking"}
+{"id": "seed-00063", "topic": "how BGP picks a path", "lang": "en", "domain": "networking"}
+{"id": "seed-00064", "topic": "reading a traceroute output", "lang": "en", "domain": "networking"}
+{"id": "seed-00065", "topic": "what a VLAN actually isolates", "lang": "en", "domain": "networking"}
+{"id": "seed-00066", "topic": "TCP vs UDP in plain terms", "lang": "en", "domain": "networking"}
+{"id": "seed-00067", "topic": "how TLS handshake protects a connection", "lang": "en", "domain": "networking"}
+{"id": "seed-00068", "topic": "why latency and bandwidth are different", "lang": "en", "domain": "networking"}
+{"id": "seed-00069", "topic": "DHCP lease lifecycle", "lang": "en", "domain": "networking"}
+{"id": "seed-00070", "topic": "what happens in a DNS outage", "lang": "en", "domain": "networking"}
+{"id": "seed-00071", "topic": "when to use a list vs a set", "lang": "en", "domain": "programming"}
+{"id": "seed-00072", "topic": "reading a stack trace efficiently", "lang": "en", "domain": "programming"}
+{"id": "seed-00073", "topic": "git rebase vs merge in practice", "lang": "en", "domain": "programming"}
+{"id": "seed-00074", "topic": "writing a good unit test", "lang": "en", "domain": "programming"}
+{"id": "seed-00075", "topic": "what a race condition is with a real example", "lang": "en", "domain": "programming"}
+{"id": "seed-00076", "topic": "choosing between polling and webhooks", "lang": "en", "domain": "programming"}
+{"id": "seed-00077", "topic": "why code review exists and how to do it well", "lang": "en", "domain": "programming"}
+{"id": "seed-00078", "topic": "debugging a memory leak step by step", "lang": "en", "domain": "programming"}
+{"id": "seed-00079", "topic": "SQL indexes and when they stop helping", "lang": "en", "domain": "programming"}
+{"id": "seed-00080", "topic": "what idempotency means for an API", "lang": "en", "domain": "programming"}
+{"id": "seed-00081", "topic": "how DNS resolves a domain name", "lang": "en", "domain": "tech-basics"}
+{"id": "seed-00082", "topic": "what a VPN actually does and does not protect", "lang": "en", "domain": "tech-basics"}
+{"id": "seed-00083", "topic": "reading a wifi speed test correctly", "lang": "en", "domain": "tech-basics"}
+{"id": "seed-00084", "topic": "choosing a password manager", "lang": "en", "domain": "tech-basics"}
+{"id": "seed-00085", "topic": "what happens when you press a URL enter key end to end", "lang": "en", "domain": "tech-basics"}
+{"id": "seed-00086", "topic": "how email delivery works", "lang": "en", "domain": "tech-basics"}
+{"id": "seed-00087", "topic": "backing up a laptop sensibly (3-2-1 rule)", "lang": "en", "domain": "tech-basics"}
+{"id": "seed-00088", "topic": "recognizing a phishing email", "lang": "en", "domain": "tech-basics"}
+{"id": "seed-00089", "topic": "why updates matter for routers", "lang": "en", "domain": "tech-basics"}
+{"id": "seed-00090", "topic": "how two-factor authentication works", "lang": "en", "domain": "tech-basics"}
+{"id": "seed-00091", "topic": "writing a clear email asking for something", "lang": "en", "domain": "writing"}
+{"id": "seed-00092", "topic": "what makes a good subject line", "lang": "en", "domain": "writing"}
+{"id": "seed-00093", "topic": "summarizing a long document without losing nuance", "lang": "en", "domain": "writing"}
+{"id": "seed-00094", "topic": "editing your own first draft", "lang": "en", "domain": "writing"}
+{"id": "seed-00095", "topic": "writing instructions someone can actually follow", "lang": "en", "domain": "writing"}
+{"id": "seed-00096", "topic": "apologizing well in writing", "lang": "en", "domain": "writing"}
+{"id": "seed-00097", "topic": "making a request to a busy person", "lang": "en", "domain": "writing"}
+{"id": "seed-00098", "topic": "how tone shifts meaning in short messages", "lang": "en", "domain": "writing"}
+{"id": "seed-00099", "topic": "structuring an argument a skeptic will accept", "lang": "en", "domain": "writing"}
+{"id": "seed-00100", "topic": "taking useful meeting notes", "lang": "en", "domain": "writing"}

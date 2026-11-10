@@ -51,3 +51,38 @@ hundred million tokens of output. Embeddings run about 10x cheaper.
 
 Working copy in S3, mirror copy in Google Drive, mirror after each batch so a bad push
 cannot lose a day of work; GitHub carries the set only when it is ready to release.
+
+## Multi-worker safety (v2)
+
+- **Claim-before-call.** A worker claims a record before its first billable call. Claims
+  live in `claims/` next to the output as one small JSON file per record. A second
+  worker's claim of a live record is refused, so two workers can never bill the same seed.
+- **Expired leases recover themselves.** A crashed run leaves its claim behind, but the
+  lease lapses (`lease_ttl_s`, default 900s) and the next claimer takes over. Nothing
+  blocks forever. Long retry backoffs renew the lease with `claim_touch`.
+- **One shared budget.** Spend accumulates in one flock-guarded ledger
+  (`spend_chars.txt`) read at startup, so N workers bill against one budget, not N.
+  A pre-call guard estimates the next call and stops before the budget passes.
+- **Deterministic plans.** Model choice and template choice hash the record id (crc32,
+  not Python's randomized `hash`), so parallel workers and reruns agree on the plan.
+
+## Prompts
+
+`prompts.py` holds four templates; choice is deterministic per record and the weights are
+the config's `templates` list (defaults to all four):
+
+- `pair-from-topic-v1` plain instruction + response, self-contained
+- `pair-constraints-v1` adds audience, length band, and format constraints (seeded per record)
+- `pair-why-v1` direct answer plus a "Why this works:" reasoning paragraph
+- `pair-edge-v1` misconception / tradeoff / scale-stress angles for harder pairs
+
+`make_seeds.py` builds the starter corpus (100 topics across 10 domains, optional
+language variants, `--langs en,id,es`, no API calls) into `seeds.jsonl`.
+
+## Smoke test path
+
+```
+python3 make_seeds.py --out seeds.jsonl
+python3 generate.py --config gen_config.json --limit 20     # first paid calls, ~20 pairs
+python3 dedupe.py --in <out>                                # quality gate
+```

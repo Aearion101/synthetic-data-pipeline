@@ -13,45 +13,37 @@ principals). Oracle bills hosted GenAI per character, so the script counts sent 
 characters, prices them against the per-million rate in the config, and stops cleanly once
 the budget is spent.
 
+Multi-worker safety:
+  * A worker CLAIMS a record before its first (billable) call. Claims live in a claims/
+    directory as one small JSON file per record; a second worker's claim of the same
+    record is refused, so two workers can never bill the same seed.
+  * Claims are leases. A crashed run leaves its claim behind, but the lease expires
+    (lease_ttl_s, default 900s) and the next worker takes over; nothing blocks forever.
+  * Spend is one shared ledger file (flock-guarded), so N workers bill against one
+    budget, not N budgets.
+
 Every record carries full provenance (model id, prompt template, parameters, timestamp) so
 the license side stays clean: Cohere-generated data is fine for the open release, and any
 public tune built on Llama-generated data has to carry "Llama" in its name (Meta license).
 Grok stays out of this pipeline by decision: xAI's terms bar helping rivals.
 """
 import argparse
+import fcntl
 import json
+import os
 import random
 import re
 import sys
 import time
+import zlib
 from datetime import datetime, timezone
 
 try:
     import oci
 except ImportError:
-    sys.exit("pip install oci first")
+    oci = None  # tests import this module without the SDK; the run itself checks below
 
-# --------------------------------------------------------------------------- prompts
-
-TEMPLATES = {}
-
-def template(name):
-    def deco(fn):
-        TEMPLATES[name] = fn
-        return fn
-    return deco
-
-@template("pair-from-topic-v1")
-def pair_from_topic_v1(topic):
-    return (
-        "You are writing one training example for an instruction-tuning dataset.\n"
-        f"Topic: {topic}\n\n"
-        "Write ONE instruction and its response. The instruction must be self-contained and "
-        "answerable without any document or link. The response must be correct, complete, and "
-        "written in plain prose.\n"
-        'Reply with ONLY a JSON object, no markdown fences, exactly:\n'
-        '{"instruction": "...", "response": "..."}'
-    )
+import prompts as P
 
 # --------------------------------------------------------------------------- helpers
 
@@ -147,6 +139,114 @@ def round_robin(models):
         seq.extend([m["model_id"]] * max(1, int(m.get("weight", 1))))
     return seq
 
+def pick_model(rr, rec_id, k):
+    """Deterministic across processes (hash() is randomized; crc32 is not)."""
+    return rr[zlib.crc32(f"{rec_id}:{k}".encode()) % len(rr)]
+
+# --------------------------------------------------------------------------- claims (leases)
+
+def claims_dir_for(cfg, out_path):
+    base = cfg.get("state_path") or os.path.dirname(os.path.abspath(out_path))
+    return os.path.join(base, "claims")
+
+def _claim_id(rec_id):
+    return rec_id.replace("/", "_")
+
+def claim_path(claims_dir, rec_id):
+    return os.path.join(claims_dir, _claim_id(rec_id) + ".claim")
+
+def _claim_lock(claims_dir, rec_id):
+    """Every claim operation on a record serializes on this lock file, so two workers
+    can never both hold a record even when they race (NFS-safe flock)."""
+    os.makedirs(claims_dir, exist_ok=True)
+    return open(os.path.join(claims_dir, "." + _claim_id(rec_id) + ".lock"), "a+")
+
+def _claim_write(path, worker_id):
+    tmp = path + f".tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump({"worker": worker_id, "ts": time.time()}, f)
+    os.replace(tmp, path)
+
+def claim_acquire(claims_dir, rec_id, worker_id, ttl_s=900.0):
+    """True iff THIS worker now holds the lease on rec_id.
+
+    A live lease (written within ttl_s) is refused, so two workers can never bill the
+    same record. An EXPIRED lease - a run that crashed and never released - is taken
+    over by the next claimer, so a dead run blocks nothing forever.
+    """
+    path = claim_path(claims_dir, rec_id)
+    with _claim_lock(claims_dir, rec_id) as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            with open(path) as f:
+                d = json.load(f)
+            live = time.time() - float(d.get("ts", 0)) <= ttl_s
+        except (OSError, ValueError):
+            live = False
+        if live:
+            return False
+        _claim_write(path, worker_id)
+        return True
+
+def claim_release(claims_dir, rec_id, worker_id):
+    path = claim_path(claims_dir, rec_id)
+    with _claim_lock(claims_dir, rec_id) as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            with open(path) as f:
+                d = json.load(f)
+            if d.get("worker") == worker_id:
+                os.unlink(path)
+        except (OSError, ValueError):
+            pass
+
+def claim_touch(claims_dir, rec_id, worker_id):
+    """Renew the lease (long retry backoffs must not let it lapse mid-work)."""
+    path = claim_path(claims_dir, rec_id)
+    with _claim_lock(claims_dir, rec_id) as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            with open(path) as f:
+                d = json.load(f)
+            if d.get("worker") != worker_id:
+                return
+            d["ts"] = time.time()
+            with open(path, "w") as f:
+                json.dump(d, f)
+        except (OSError, ValueError):
+            pass
+
+# --------------------------------------------------------------------------- shared budget
+
+def spend_path_for(cfg, out_path):
+    base = cfg.get("state_path") or os.path.dirname(os.path.abspath(out_path))
+    return cfg.get("spend_path") or os.path.join(base, "spend_chars.txt")
+
+def spend_read(path):
+    try:
+        with open(path) as f:
+            return float(f.read().strip() or 0)
+    except FileNotFoundError:
+        return 0.0
+
+def spend_add(path, n_chars):
+    """Add chars to the shared ledger under an exclusive lock; returns the new total."""
+    with open(path, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.seek(0)
+        total = float(f.read().strip() or 0)
+        total += n_chars
+        f.seek(0)
+        f.truncate()
+        f.write(str(total))
+        f.flush()
+        os.fsync(f.fileno())
+        fcntl.flock(f, fcntl.LOCK_UN)
+    return total
+
+def budget_ok(chars, est_next_chars, price, budget):
+    return (chars + est_next_chars) / 1e6 * price < budget
+
 # --------------------------------------------------------------------------- main
 
 def main():
@@ -165,6 +265,10 @@ def main():
     price = cfg.get("price_per_million_chars", 0.18)
     budget = cfg.get("budget_usd", 300.0)
     gap = 60.0 / cfg.get("requests_per_minute", 12)
+    ttl = float(cfg.get("lease_ttl_s", 900))
+    claims_dir = claims_dir_for(cfg, out_path)
+    spend_path = spend_path_for(cfg, out_path)
+    worker_id = f"{os.uname().nodename}:{os.getpid()}:{int(time.time())}"
     n_max = args.limit if args.limit else 10**9
 
     if args.dry_run:
@@ -172,27 +276,37 @@ def main():
         print(f"dry run: {len(seeds)} seeds, {calls} planned calls, {len(rr)} model slots")
         return
 
+    if oci is None:
+        sys.exit("pip install oci first")
     if cfg.get("compartment_id", "SET_ME") == "SET_ME":
         sys.exit("set compartment_id in the config first")
 
     client = oci.generative_ai_inference.GenerativeAiInferenceClient(
         oci.config.from_file(profile_name=cfg.get("profile", "DEFAULT")))
 
-    chars = 0
-    cost = 0.0
+    chars = spend_read(spend_path)
+    cost = chars / 1e6 * price
     made = 0
+    print(f"[{worker_id}] resuming: {len(done)} done, ${cost:.2f} already spent of ${budget:.0f}")
     with open(out_path, "a", encoding="utf-8") as out:
         for seed in seeds:
             if made >= n_max or cost >= budget:
                 break
             for k in range(seed.get("n_pairs", cfg.get("pairs_per_seed", 4))):
-                model_id = rr[(seed["id"].__hash__() + k) % len(rr)]
+                model_id = pick_model(rr, seed["id"], k)
                 rec_id = f"{seed['id']}#{k+1}#{model_id.rsplit('.', 1)[-1][:24]}"
                 if rec_id in done:
                     continue
                 if cost >= budget or made >= n_max:
                     break
-                prompt = TEMPLATES[cfg.get("template", "pair-from-topic-v1")](seed["topic"])
+                tname = P.pick_template(cfg, seed["id"], k)
+                prompt = P.TEMPLATES[tname](seed, k)
+                est_next = len(prompt) + int(cfg["max_tokens"]) * 4
+                if not budget_ok(chars, est_next, price, budget):
+                    print(f"budget guard: ${cost:.2f} + next call would pass ${budget:.0f}, stopping")
+                    break
+                if not claim_acquire(claims_dir, rec_id, worker_id, ttl):
+                    continue  # another worker holds (or races) this record
                 for attempt in range(cfg.get("max_retries", 4) + 1):
                     try:
                         reply = call_model(client, cfg, model_id, prompt)
@@ -200,25 +314,30 @@ def main():
                     except Throttled:
                         wait = 15 * (attempt + 1)
                         print(f"throttled, waiting {wait}s")
+                        claim_touch(claims_dir, rec_id, worker_id)
                         time.sleep(wait)
                     except Exception as e:
                         if attempt == cfg.get("max_retries", 4):
                             print(f"SKIP {rec_id}: {e}")
                             reply = None
                             break
+                        claim_touch(claims_dir, rec_id, worker_id)
                         time.sleep(2 ** attempt)
                 if reply is None:
+                    claim_release(claims_dir, rec_id, worker_id)
                     continue
                 n_chars = len(prompt) + len(reply)
-                chars += n_chars
+                chars = spend_add(spend_path, n_chars)
                 cost = chars / 1e6 * price
                 try:
                     instr, resp = parse_pair(reply)
                 except (ValueError, json.JSONDecodeError) as e:
                     print(f"SKIP {rec_id}: parse: {e}")
+                    claim_release(claims_dir, rec_id, worker_id)
                     continue
                 if len(instr) < 15 or len(resp) < 15:
                     print(f"SKIP {rec_id}: too short")
+                    claim_release(claims_dir, rec_id, worker_id)
                     continue
                 rec = {
                     "id": rec_id,
@@ -227,7 +346,7 @@ def main():
                     "source": "synthetic",
                     "generator": {
                         "model": model_id,
-                        "template": cfg.get("template", "pair-from-topic-v1"),
+                        "template": tname,
                         "temperature": cfg["temperature"],
                         "max_tokens": cfg["max_tokens"],
                     },
@@ -235,7 +354,9 @@ def main():
                 }
                 out.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 out.flush()
+                os.fsync(out.fileno())
                 done.add(rec_id)
+                claim_release(claims_dir, rec_id, worker_id)
                 made += 1
                 print(f"[{made}] {rec_id} chars={chars} est=${cost:.2f} of ${budget:.0f}")
                 time.sleep(gap)
