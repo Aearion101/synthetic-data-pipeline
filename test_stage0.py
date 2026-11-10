@@ -535,19 +535,19 @@ def suite():
     check("T25 a corrupt complete line still raises (fail loud, never guess)", raised)
 
     # T26 (Fo 0245 addendum item 1): the shipped one-stage config cannot refuse its
-    # own rows. The longest one-stage render in pack v2 is 1,041 bytes (Instinct
-    # 0350, ChatGPT 0401; v1's was 922); at max_tokens 1024 the reply term is
-    # 113 x 1024 = 115,712; with the 200-char overhead the worst attempt is
-    # 1,041 + 200 + 115,712 = 116,953 <= 120,000, so the shipped config produces
-    # NO zero-call green exit from cap refusals.
+    # own rows. The longest one-stage render in pack v2.1 is 1,053 bytes
+    # (Instinct 0446, ChatGPT 0500; v2's was 1,041, v1's 922); at max_tokens
+    # 1024 the reply term is 113 x 1024 = 115,712; with the 200-char overhead
+    # the worst attempt is 1,053 + 200 + 115,712 = 116,965 <= 120,000, so the
+    # shipped config produces NO zero-call green exit from cap refusals.
     cfg = fresh({"attempt_char_cap": 120000, "max_tokens": 1024})
     cfg["run_id"] = "t26"
     seed = {"id": "seed-t26", "topic": "rain"}
-    prompt = "x" * 1041
+    prompt = "x" * 1053
     a, reply = R.run_once(cfg, lambda: SpyClient(["ok"]), seed, "alpha.model", prompt,
                           R.Ledger(cfg["ledger_path"]), max_out_chars=113 * cfg["max_tokens"],
                           overhead_chars=200)
-    check("T26 longest one-stage row (1,041 bytes) is NOT refused_cap at 1024/120000",
+    check("T26 longest one-stage row (1,053 bytes) is NOT refused_cap at 1024/120000",
           a.status == "completed", f"status={a.status} error={getattr(a, 'error', None)}")
     refused_total = a.input_chars + 113 * cfg["max_tokens"]
     check("T26 shipped-config arithmetic stays under the cap",
@@ -596,8 +596,8 @@ def suite():
 
     # T29 (Fo 0245 addendum item 1): the shipped example config itself states the
     # one-stage shape: one pair per row, the one-stage template label, and the
-    # numbers DeepSeek 0236 measured (1024 fits the 120,000 cap on the pack v2
-    # longest row, 1,041 bytes: 1,041 + 200 + 115,712 = 116,953).
+    # numbers DeepSeek 0236 measured (1024 fits the 120,000 cap on the pack
+    # v2.1 longest row, 1,053 bytes: 1,053 + 200 + 115,712 = 116,965).
     ecfg = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                        "gen_config.example.json")))
     check("T29 shipped config: pairs_per_seed 1 and the one-stage template label",
@@ -605,7 +605,7 @@ def suite():
           f"pairs={ecfg.get('pairs_per_seed')} template={ecfg.get('template')}")
     check("T29 shipped config: max_tokens 1024 fits attempt_char_cap 120000",
           ecfg.get("max_tokens") == 1024 and ecfg.get("attempt_char_cap") == 120000
-          and 1041 + 200 + 113 * 1024 <= ecfg["attempt_char_cap"],
+          and 1053 + 200 + 113 * 1024 <= ecfg["attempt_char_cap"],
           f"max_tokens={ecfg.get('max_tokens')} cap={ecfg.get('attempt_char_cap')}")
 
     # T30 (Claude 0341 F1, Instinct 0346/0349 ruling): tolerant JSON decoding.
@@ -655,6 +655,42 @@ def suite():
           any(r.get("pair_key") == "seed-1#1" and r["status"] == "claimed"
               for r in l1.rows()),
           f"rows={len(l1.rows())}")
+
+    # T32 (Instinct 0445/0446, ChatGPT 0404/0502): the pack source-language
+    # hold. Four real v2.1 shapes: (a) a supported non-translation row with
+    # missing optional pair flags proceeds; (b) a supported translation row with
+    # the pair documented proceeds; (c) an A-target row quoting an off-list
+    # source stays held even if execution_status was marked eligible by
+    # mistake; (d) a stratum-B target row stays held. A plain {id, topic} seed
+    # (no support block) still runs unchanged.
+    check("T32 (a) supported non-translation, missing optional pair flags: proceeds",
+          R.hold_reason({"support": {"llama4_documented": True}}) is None)
+    check("T32 (b) supported translation, pair fully documented: proceeds",
+          R.hold_reason({"support": {"llama4_documented": True},
+                         "off_list_source_language": False,
+                         "llama4_pair_fully_documented": True}) is None)
+    check("T32 (c) A-target off-list-source row: held despite a documented target",
+          R.hold_reason({"support": {"llama4_documented": True},
+                         "off_list_source_language": True,
+                         "llama4_pair_fully_documented": False})
+          == "off-list-source-language")
+    check("T32 (d) stratum-B target row: held (language off the documented list)",
+          R.hold_reason({"support": {"llama4_documented": False}})
+          == "llama4-undocumented-language")
+    check("T32 plain {id, topic} seed without a support block: proceeds",
+          R.hold_reason({"id": "s", "topic": "rain"}) is None)
+    check("T32 translation row not fully documented: held",
+          R.hold_reason({"support": {"llama4_documented": True},
+                         "off_list_source_language": False,
+                         "llama4_pair_fully_documented": False})
+          == "llama4-pair-not-fully-documented")
+    # and main()'s gate orders status before hold: a pending row is counted as
+    # pending_user_approval, not by its hold reason.
+    import types
+    check("T32 hold_reason does not fire on a pending row's own status field",
+          R.hold_reason({"execution_status": "pending_user_approval",
+                         "support": {"llama4_documented": False}})
+          == "llama4-undocumented-language")
 
 def worker(cfg, n, q):
     """Same five seeds from two workers. Config arrives as an argument so the

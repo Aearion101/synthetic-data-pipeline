@@ -251,6 +251,35 @@ def record_chars(text):
     over-reserve, never under-reserve."""
     return len(text.encode("utf-8"))
 
+def hold_reason(row):
+    """Source-language hold for prompt-pack rows (Instinct 0445/0446 rulings,
+    ChatGPT 0404/0502 handoff), grounded in the pack README's support-flag
+    semantics. Returns a hold reason string, or None when the row may run:
+    1. support.llama4_documented is False -> the row's own output language is
+       not on the documented list (stratum-B targets); held until Dylan rules
+       on language scope (the Oct 31 rule: train only on model-supported).
+    2. off_list_source_language is True -> the quoted SOURCE passage is a
+       stratum-B language even when the target is documented; the pack README
+       says any execution filter MUST also exclude these, so the runner does,
+       even if execution_status was marked eligible by mistake.
+    3. llama4_pair_fully_documented is False -> a translation row whose pair
+       is not fully documented; held.
+    Absence holds nothing: the optional pair field is missing on 3,719
+    non-translation rows (3,349 of them stratum-A), and rows without a support
+    block at all (plain {id, topic} seeds, older fixtures) run unchanged.
+    Stated limit: the guard is Llama-4-keyed per the Oct 31 rule; lfm3/qwen3
+    support flags are recorded in the pack but not enforced here until Dylan
+    rules. With production rows all pending_user_approval, this guard changes
+    nothing today; it only stops an eligible-marked held row from billing."""
+    support = row.get("support") or {}
+    if support.get("llama4_documented") is False:
+        return "llama4-undocumented-language"
+    if row.get("off_list_source_language") is True:
+        return "off-list-source-language"
+    if row.get("llama4_pair_fully_documented") is False:
+        return "llama4-pair-not-fully-documented"
+    return None
+
 def claim_seed(cfg, claim_key, model_id, ledger):
     """Cross-process reserve-and-check (DeepSeek 2137, adopted Instinct 0002 item 1):
     under the ledger flock, re-read the ledger and append a claimed row if the
@@ -650,6 +679,13 @@ def main():
         st = seed.get("execution_status", "eligible")
         if st != "eligible":
             skipped_status[st] = skipped_status.get(st, 0) + 1
+            continue
+        # Pack source-language hold (Instinct 0445/0446, ChatGPT 0404/0502):
+        # an eligible-marked row the pack flags as not model-supported stays
+        # skipped, counted by hold reason in the run-end line.
+        hold = hold_reason(seed)
+        if hold:
+            skipped_status[hold] = skipped_status.get(hold, 0) + 1
             continue
         if cfg.get("require_rendered_prompt") and not seed.get("prompt"):
             sys.exit(f"seed {seed.get('id')} has no rendered prompt field and "
