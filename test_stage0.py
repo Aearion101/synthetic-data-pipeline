@@ -10,7 +10,7 @@ factory. Known-red check: T11 asserts at most one attempt per seed across
 workers, which cannot hold without a cross-process ledger lock; it is marked
 expected-failure with that reason and stays red until the lock lands
 (DeepSeek 2137 spend_cap flock, lead's call on the rail)."""
-import json, os, subprocess, sys, tempfile, multiprocessing
+import json, os, subprocess, sys, tempfile, multiprocessing, fcntl
 
 import runner_v2 as R
 
@@ -55,6 +55,7 @@ class SpyClient:
         v = self.script[min(self.i, len(self.script) - 1)]; self.i += 1
         if v == "boom":   raise RuntimeError("stub boom")
         if v == "timeout": raise TimeoutError("stub timeout")
+        if v == "throttle": raise R.OciAdapter.Throttled("stub 429")
         return v, {"output_tokens": 42}
 
 def run_main(cfg, script, monkey_factory=None):
@@ -147,9 +148,9 @@ def suite():
     for r in rows:
         if r["status"] != "pending":
             per_seed.setdefault(r["seed_id"], set()).add(r["attempt_id"])
-    xfail_check("T2 corrected: at most one attempt per seed across workers",
-                all(len(v) == 1 for v in per_seed.values()),
-                "needs a cross-process ledger lock (DeepSeek 2137 spend_cap flock)")
+    check("T2 corrected: at most one attempt per seed across workers (reserve-and-check)",
+          all(len(v) == 1 for v in per_seed.values()),
+          f"per_seed={ {k: len(v) for k, v in per_seed.items()} }")
 
     # T2b: pending claim blocks a second worker on the same seed (main()'s own key)
     cfg = fresh()
@@ -181,7 +182,7 @@ def suite():
     rows = R.Ledger(cfg["ledger_path"]).rows()
     check("T4 unknown counted as spent", any(r["status"] == "unknown" for r in rows))
     check("T4 timeout counted as spent", any(r["status"] == "timeout" for r in rows))
-    base = len(b'prompt for rain (pair 1)')
+    base = len(b'prompt for rain (pair 1)') + 200  # + prompt_overhead_chars default
     for st in ("unknown", "timeout"):
         r = [x for x in rows if x["status"] == st][0]
         check(f"T4 {st} attempt charged its full pre-call reservation (input + 113 x max_tokens)",
@@ -274,16 +275,128 @@ def suite():
     check("T12 too-short pair filtered (below the 15-byte floor), no record written",
           len(out_lines) == 0, f"records={len(out_lines)}")
 
-    # T13: adapter extraction walks nested structures without touching the oci SDK
+    # T13: adapter reads the REAL message field, never a longest-string guess
     ad = object.__new__(R.OciAdapter)
     ad.cfg = {}
     fake = type("FakeData", (), {})()
-    fake.to_dict = lambda: {"data": {"choices": [{"text": "short"}, {"text": "the longest text here"}]}}
-    got = ad._extract_text(fake)
-    check("T13 adapter _extract_text walks nested data and takes the longest text",
-          got == "the longest text here", f"got={got!r}")
+    fake.to_dict = lambda: {"choices": [{"message": {"content": "the real reply"}}], "usage": {"output_tokens": 9}}
+    got, usage = ad._reply_and_usage(fake)
+    check("T13 adapter reads choices[0].message.content and passes usage verbatim",
+          got == "the real reply" and usage == {"output_tokens": 9}, f"got={got!r} usage={usage!r}")
+    fake2 = type("FakeData", (), {})()
+    fake2.to_dict = lambda: {"something": "else"}
+    refused = False
+    try:
+        ad._reply_and_usage(fake2)
+    except RuntimeError as e:
+        refused = "refusing to guess" in str(e)
+    check("T13 adapter refuses to guess when no message field exists",
+          refused, f"refused={refused}")
     check("T13 adapter exposes .generate(model_id, prompt, cfg)",
           callable(getattr(R.OciAdapter, "generate", None)))
+
+    # T14: one-worker run lock: a second process refuses and books nothing
+    cfg = fresh(); write_seeds(cfg, 2)
+    d = os.path.dirname(cfg["seeds_path"]); p = os.path.join(d, "cfg14.json")
+    json.dump(cfg, open(p, "w"))
+    fd = R.acquire_run_lock(cfg["ledger_path"])
+    check("T14 run lock acquired by first worker", fd is not None)
+    second = R.acquire_run_lock(cfg["ledger_path"])
+    check("T14 second lock attempt in-process refused (non-blocking)",
+          second is None, f"second={second}")
+    fcntl.flock(fd, fcntl.LOCK_UN); fd.close()
+    q2 = multiprocessing.Queue()
+    def holder(path, qu):
+        import runner_v2 as RR
+        f = RR.acquire_run_lock(path)
+        qu.put("held" if f else "none")
+        import time; time.sleep(2)
+        if f: fcntl.flock(f, fcntl.LOCK_UN); f.close()
+    ph = multiprocessing.Process(target=holder, args=(cfg["ledger_path"], q2))
+    ph.start(); import time as _t; _t.sleep(0.5)
+    check("T14 cross-process: child holds, parent refuses",
+          R.acquire_run_lock(cfg["ledger_path"]) is None)
+    ph.join(10)
+    check("T14 child reported holding the lock", q2.get() == "held")
+
+    # T15: cap refusal returns the sentinel, books nothing, kills nothing
+    cfg = fresh(); write_seeds(cfg, 2); cfg["attempt_char_cap"] = 300
+    run_main(cfg, ["ok"])
+    check("T15 cap refusal: no attempt booked, run survives",
+          R.Ledger(cfg["ledger_path"]).attempts() == 0 and len(out_recs(cfg["out_path"])) == 0,
+          f"attempts={R.Ledger(cfg['ledger_path']).attempts()}")
+
+    # T16: held seeds are LISTED at run end, never auto-released
+    import io, contextlib
+    cfg = fresh(); write_seeds(cfg, 1)
+    l = R.Ledger(cfg["ledger_path"])
+    heldrow = R.Attempt("w0", "seed-00001", cfg["models"][0]["model_id"])
+    heldrow.input_chars = 1000; heldrow.output_chars = MAX_OUT
+    l.append(heldrow)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        run_main(cfg, [PAIR])
+    out_text = buf.getvalue()
+    check("T16 held seed listed for manual reconciliation at run end",
+          "held seeds awaiting manual reconciliation" in out_text and "seed-00001" in out_text,
+          f"out={out_text[-200:]}")
+
+    # T17: prompt-pack consumption: execution_status gates, rendered prompt is used
+    cfg = fresh()
+    with open(cfg["seeds_path"], "w") as f:
+        f.write(json.dumps({"id": "seed-00001", "topic": "rain", "language": "en",
+                            "split": "holdout", "execution_status": "held"}) + "\n")
+        f.write(json.dumps({"id": "seed-00002", "topic": "rain", "language": "id",
+                            "split": "dev", "execution_status": "eligible",
+                            "prompt": "RENDERED PROMPT GOES HERE"}) + "\n")
+    d = os.path.dirname(cfg["seeds_path"]); p = os.path.join(d, "cfg17.json")
+    json.dump(cfg, open(p, "w"))
+    seen_prompts = []
+    class RecSpy(SpyClient):
+        def generate(self, model_id, prompt, cfg):
+            seen_prompts.append(prompt)
+            return super().generate(model_id, prompt, cfg)
+    rec_client = [None]
+    def rec_factory(c):
+        if rec_client[0] is None: rec_client[0] = RecSpy([PAIR])
+        return rec_client[0]
+    sys.argv = ["runner_v2.py", "--config", p]
+    saved_bc = R.build_client; R.build_client = rec_factory
+    try: R.main()
+    finally: R.build_client = saved_bc
+    recs = out_recs(cfg["out_path"])
+    check("T17 execution_status=held row skipped and counted, eligible row ran once",
+          len(seen_prompts) == 1 and recs and recs[0]["id"].startswith("seed-00002"),
+          f"prompts={seen_prompts} recs={len(recs)}")
+    check("T17 rendered prompt field is what the model received",
+          seen_prompts and seen_prompts[0] == "RENDERED PROMPT GOES HERE",
+          f"got={seen_prompts[:1]}")
+    check("T17 record carries language, split and prompt_source=rendered",
+          recs and recs[0].get("language") == "id" and recs[0].get("split") == "dev"
+          and recs[0].get("prompt_source") == "rendered",
+          f"rec={ {k: recs[0].get(k) for k in ('language','split','prompt_source')} if recs else None }")
+
+    # T18: num_generations other than 1 fails fast
+    cfg = fresh(); write_seeds(cfg, 1); cfg["num_generations"] = 4
+    d = os.path.dirname(cfg["seeds_path"]); p = os.path.join(d, "cfg18.json")
+    json.dump(cfg, open(p, "w")); sys.argv = ["runner_v2.py", "--config", p]
+    try:
+        R.main(); fast = False
+    except SystemExit as e:
+        fast = "num_generations" in str(e)
+    check("T18 num_generations != 1 fails fast before any call", fast is True)
+
+    # T20: a 429 closes its attempt as throttled; the retry is a NEW reserved attempt
+    cfg = fresh(); write_seeds(cfg, 1)
+    run_main(cfg, ["throttle", PAIR])
+    rows = R.Ledger(cfg["ledger_path"]).rows()
+    eff = R.Ledger(cfg["ledger_path"]).effective_rows()
+    check("T20 throttled attempt closes as throttled and keeps its reservation",
+          any(r["status"] == "throttled" for r in eff),
+          f"statuses={[r['status'] for r in eff]}")
+    check("T20 retry after 429 is a new reserved attempt and the pair is made",
+          len(eff) == 2 and len(out_recs(cfg["out_path"])) == 1,
+          f"attempts={len(eff)} recs={len(out_recs(cfg['out_path']))}")
 
 def worker(cfg, n, q):
     """Same five seeds from two workers. Config arrives as an argument so the
@@ -297,8 +410,12 @@ def worker(cfg, n, q):
         if model is None:
             continue                      # another worker holds this seed: skip, never bill null
         prompt = f"prompt for rain (pair 1)"
+        claim = R.claim_seed(cfg, sid, model, ledger)
+        if claim is None:
+            continue                      # reserve-and-check lost the race: skip
         R.run_once(cfg, lambda: SpyClient(script), seed, model, prompt, ledger,
-                   max_out_chars=113 * cfg["max_tokens"])
+                   max_out_chars=113 * cfg["max_tokens"], attempt_row=claim,
+                   overhead_chars=200)
     q.put(True)
 
 if __name__ == "__main__":

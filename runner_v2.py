@@ -24,14 +24,13 @@ Fixes from the independent PR #1 reviews (DeepSeek 2235/2236, Claude 2238/2241) 
     (close wins), a held seed is skipped, and a None model can no longer crash main();
  13 the client is built and interface-checked outside the try, before the reservation
     row: misconfiguration raises, the ledger never books an attempt that never ran;
- 14 main() fails fast when attempt_char_cap is absent from the config (DeepSeek F6).
+ 14 main() fails fast when attempt_char_cap is absent from the config (DeepSeek F6);
  15 F1, writer restored from generate.py (Instinct 2245 ask): run_once returns the
     reply; main() parses it, writes the record (generate.py's shape: id, instruction,
     response, source, generator, created_utc) to out_path with flush per record and
     seeds_done checkpointing, so a restart does not re-bill completed pairs;
- 16 F5, adapter restored: OciAdapter.generate(model_id, prompt, cfg) wraps the
-    client call shape generate.py uses (cohere rides chat(), llama rides
-    generate_text(), text extracted from .data), so the real OCI path is callable;
+ 16 F5, adapter restored: OciAdapter.generate(model_id, prompt, cfg) wraps the client
+    call shape, so the real OCI path is callable;
  17 F6, parse-and-filter between completed and made (Claude 2238 #6): an unparseable
     or too-short reply closes its attempt as "unparseable" (last row per attempt_id
     wins in effective_rows()) and never counts as a made pair;
@@ -42,11 +41,50 @@ Fixes from the independent PR #1 reviews (DeepSeek 2235/2236, Claude 2238/2241) 
  rides stage-1 reconciliation against Oracle's usage view. An unknown, timed-out,
  killed or unparseable attempt keeps its FULL reservation until that independent
  reconciliation; it is never released on timeout (Instinct 2246 item 3).
- Still open: F7 retry policy (generate.py's; the runner makes no retries of its
- own), a cross-process ledger lock (DeepSeek 2137 spend_cap flock; the runner is
- single-writer-safe only), pending-row recovery for a killed worker (lead's call).
+
+Fixes from Instinct 0002/0003/0005/0007/0008/0010 (2026-11-11):
+ 19 Llama goes through chat() with GenericChatRequest (api_format GENERIC), NOT
+    generate_text() (Instinct 0003, doc-checked against the OCI Python SDK docs,
+    not yet run live); Cohere keeps CohereChatRequest on chat().
+ 20 num_generations pinned to 1 in the request AND the reservation arithmetic; a
+    config asking for more fails fast (each extra generation multiplies billing).
+ 21 NoneRetryStrategy on the OCI client so the SDK performs no hidden retries: the
+    runner's ledger is the only retry layer (one runner attempt = one billed call).
+ 22 reply extracted from the REAL message field (choices[0].message.content for
+    GENERIC chat, chat_response.text for Cohere); a reply without that field is an
+    error, never a longest-string guess.
+ 23 usage object recorded verbatim when the response carries one.
+ 24 one-worker enforcement is code: a non-blocking exclusive flock on
+    <ledger>.runlock at startup; a second process exits non-zero and books nothing
+    (Instinct 0003 item 5; test starts a second process and asserts the refusal).
+ 25 cross-process reserve-and-check (DeepSeek 2137 spend_cap design): claim_seed()
+    takes the ledger flock, re-reads, and appends a "claimed" row before releasing,
+    so two workers cannot bill the same seed; T2 runs green on this path.
+ 26 every ledger append takes the same flock (short hold) so appends from two
+    processes cannot interleave; effective_rows() is cached (no O(n^2) re-read).
+ 27 cap refusal (input bytes + reply term over attempt_char_cap) returns a
+    "refused_cap" sentinel; main() skips and logs it, no TypeError kills the run.
+ 28 a 429 closes its attempt as "throttled" (reservation kept, counted spent until
+    stage-1 reconciliation) and main() retries after backoff as a NEW reserved
+    attempt, bounded by max_retries (default 2); never a silent repeat.
+ 29 the budget/attempt-cap break exits the WHOLE run, not just the inner loop.
+ 30 held seeds (pending/claimed rows) are LISTED at run end with the manual
+    reconcile step named; they are never auto-released.
+ 31 reservation covers the FULL billed input: prompt bytes PLUS
+    prompt_overhead_chars (default 200, a stated conservative overhead for any
+    system/template text the service may add; Instinct 0008 item 3). The runner
+    sends a single user message and no system prompt of its own.
+ 32 prompt-pack consumption (Instinct 0010): seed rows may carry prompt (fully
+    rendered; reserved on ITS bytes), id, language, split, execution_status. Rows
+    not marked execution_status="eligible" are skipped and COUNTED, never run.
+    With cfg["require_rendered_prompt"], a row without prompt fails fast. Field
+    names Fo committed to the producer: prompt, id, language, split,
+    execution_status (extra keys ride into provenance verbatim).
+ Still open: pending-row recovery for a killed worker (lead's call; listed at run
+ end per 30 until then). Region, max_tokens enforcement and usage-view lag are
+ stage-1 observations, not settled facts.
 """
-import argparse, hashlib, json, os, sys, time, uuid
+import argparse, fcntl, hashlib, json, os, sys, time, uuid
 from datetime import datetime, timezone
 
 def now():
@@ -61,43 +99,68 @@ class Attempt:  # reservation row, written before the call
     def __init__(self, run_id, seed_id, model):
         self.attempt_id = f"{run_id}-{uuid.uuid4().hex[:8]}"
         self.run_id, self.seed_id, self.model = run_id, seed_id, model
-        self.status = "pending"          # pending -> completed|failed|timeout|unknown
+        self.status = "pending"          # claimed -> pending -> completed|failed|timeout|unknown|throttled|released|unparseable
         self.input_chars = self.output_chars = 0
         self.usage = None
         self.started_utc, self.ended_utc, self.error = now(), None, None
     def row(self):
         return {k: getattr(self, k) for k in self.FIELDS}
 
+SPENT_STATUSES = ("completed","failed","timeout","unknown","pending","claimed","throttled")
+HELD_STATUSES = ("pending","claimed")
+# A seed with one of these rows is never re-claimed: closed non-throttled attempts
+# may already be billable, and the lead rule (Instinct 0002 item 3) forbids
+# silently retrying them. "throttled" is re-claimable: the service refused the
+# request, so the bounded retry books a NEW attempt after backoff.
+BLOCKED_STATUSES = ("completed","failed","timeout","unknown","pending","claimed","unparseable")
+
 class Ledger:
     """Append-only JSONL. Budget and attempt caps are computed from ALL rows, so a
-    restart cannot reset the spend and a killed process leaves its pending row."""
+    restart cannot reset the spend and a killed process leaves its pending row.
+    Every append takes an flock on <path>.lock (short hold) so appends from two
+    processes cannot interleave (Instinct 0002 item 1). rows() caches the parse;
+    appends invalidate it, so the O(n^2) re-read is gone (Instinct 0007 item 5)."""
     def __init__(self, path):
         self.path = path
-    def append(self, a):
+        self._rows = None
+    def _lockfile(self):
+        return self.path + ".lock"
+    def _append_unlocked(self, row):
         with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(a.row(), ensure_ascii=False) + "\n")
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
             fh.flush(); os.fsync(fh.fileno())
-    def rows(self):
+        self._rows = None
+    def append(self, a):
+        lock = open(self._lockfile(), "a")
         try:
-            with open(self.path, encoding="utf-8") as fh:
-                return [json.loads(l) for l in fh if l.strip()]
-        except FileNotFoundError:
-            return []
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self._append_unlocked(a.row() if isinstance(a, Attempt) else a)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN); lock.close()
+    def rows(self):
+        if self._rows is None:
+            try:
+                with open(self.path, encoding="utf-8") as fh:
+                    self._rows = [json.loads(l) for l in fh if l.strip()]
+            except FileNotFoundError:
+                self._rows = []
+        return self._rows
     def effective_rows(self):
         """One row per attempt: the LAST row written for that attempt_id wins.
-        Reservations and closes share attempt_id by design, and a later close
-        (for example completed then unparseable) supersedes the earlier one."""
+        Claims, reservations and closes share attempt_id by design, and a later
+        close (for example completed then unparseable) supersedes the earlier one."""
         best = {}
         for r in self.rows():
             best[r["attempt_id"]] = r
         return list(best.values())
     def spent_chars(self):
-        # unknown/pending/failed/timeout all count: a call may be billable though
-        # its response never landed (ChatGPT 1703, Instinct 2020).
+        # unknown/pending/claimed/failed/timeout/throttled all count: a call may be
+        # billable though its response never landed (ChatGPT 1703, Instinct 2020).
+        # released and refused_cap do not: nothing was sent.
         return sum(r["input_chars"] + r["output_chars"] for r in self.effective_rows()
-                   if r["status"] in ("completed","failed","timeout","unknown","pending"))
+                   if r["status"] in SPENT_STATUSES)
     def attempts(self):
-        return len(self.effective_rows())
+        return sum(1 for r in self.effective_rows() if r["status"] != "released")
 
 def record_chars(text):
     """Recorded char counts are UTF-8 BYTES. The reservation must be conservative,
@@ -108,25 +171,55 @@ def record_chars(text):
     over-reserve, never under-reserve."""
     return len(text.encode("utf-8"))
 
-def run_once(cfg, client_factory, seed, model_id, prompt, ledger, max_out_chars=None):
-    """One attempt: reserve, call, close the row. Returns the row's final status."""
-    a = Attempt(cfg["run_id"], seed["id"], model_id)
-    a.input_chars = record_chars(prompt)
+def claim_seed(cfg, seed_id, model_id, ledger):
+    """Cross-process reserve-and-check (DeepSeek 2137, adopted Instinct 0002 item 1):
+    under the ledger flock, re-read the ledger and append a claimed row if the seed
+    is free; return the claim row, or None when another worker holds it."""
+    lock = open(ledger._lockfile(), "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        ledger._rows = None          # fresh read under the lock: other workers'
+                                     # appends cannot invalidate our cache
+        for r in ledger.effective_rows():
+            if r.get("seed_id") == seed_id and r["status"] in BLOCKED_STATUSES:
+                return None                      # held or already attempted: never re-bill
+        c = Attempt(cfg["run_id"], seed_id, model_id)
+        c.status = "claimed"
+        ledger._append_unlocked(c.row())
+        return c
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN); lock.close()
+
+def run_once(cfg, client_factory, seed, model_id, prompt, ledger, max_out_chars=None,
+             attempt_row=None, overhead_chars=0):
+    """One attempt: reserve, call, close the row. Returns (row, reply); a pre-call
+    cap refusal returns a refused_cap sentinel row (nothing was sent, nothing is
+    booked as spend). A Throttled 429 closes its row and re-raises so main() can
+    back off and book a NEW reserved attempt (Instinct 0007 item 3)."""
+    a = attempt_row or Attempt(cfg["run_id"], seed["id"], model_id)
+    a.input_chars = record_chars(prompt) + overhead_chars
     if max_out_chars and a.input_chars + max_out_chars > cfg["attempt_char_cap"]:
-        return None  # caller handles pre-call cap refusal
+        refusal = {"attempt_id": a.attempt_id, "run_id": cfg["run_id"], "seed_id": seed["id"],
+                   "model": model_id, "status": "refused_cap", "input_chars": a.input_chars,
+                   "output_chars": 0, "usage": None, "started_utc": now(), "ended_utc": now(),
+                   "error": f"input {a.input_chars} + reply term {max_out_chars} over "
+                            f"attempt_char_cap {cfg['attempt_char_cap']}; nothing sent"}
+        return refusal, None
     # Build and interface-check the client OUTSIDE the try, before the reservation
     # row exists: a missing oci package, missing credentials or a client without
     # .generate is a misconfiguration, not possible spend, so it must raise instead
-    # of being booked as "unknown" (Claude 2238 finding 5).
+    # of being booked as "unknown" (Claude 2238 finding 5). When a claim row was
+    # already booked, the caller releases it on this raise.
     client = client_factory()
     if not hasattr(client, "generate"):
         raise TypeError(
             f"client for {model_id} has no .generate(model_id, prompt, cfg); "
-            "the real OCI path needs a chat()/generate_text() adapter (stage 1+)")
+            "the real OCI path needs the chat() adapter (stage 1+)")
     # Reserve the reply term before the call. An attempt whose outcome is unknown
     # keeps this reservation; only a completed row settles it to the actual count.
-    # (committed = settled if settled else reserved)
     a.output_chars = max_out_chars or 0
+    if a.status == "claimed":
+        a.status = "pending"
     ledger.append(a)                       # reservation BEFORE the call
     reply = None
     try:
@@ -134,6 +227,10 @@ def run_once(cfg, client_factory, seed, model_id, prompt, ledger, max_out_chars=
         a.output_chars = record_chars(reply)
         a.usage = usage
         a.status = "completed"; a.ended_utc = now()
+    except OciAdapter.Throttled:
+        a.status = "throttled"; a.ended_utc = now(); a.error = "429 throttled"
+        ledger.append(a)
+        raise
     except TimeoutError:
         a.status = "timeout"; a.ended_utc = now(); a.error = "timeout"
     except Exception as e:
@@ -141,6 +238,19 @@ def run_once(cfg, client_factory, seed, model_id, prompt, ledger, max_out_chars=
         a.status = "unknown"; a.ended_utc = now(); a.error = str(e)[:200]
     ledger.append(a)                       # closing row (supersedes pending)
     return a, reply
+
+def release_claim(ledger, a):
+    """A claim that will never make a call (client misconfiguration) releases with
+    zero bytes; released rows count as no spend and no attempt."""
+    c = Attempt(a["run_id"] if isinstance(a, dict) else a.run_id,
+                a["seed_id"] if isinstance(a, dict) else a.seed_id,
+                a["model"] if isinstance(a, dict) else a.model)
+    if isinstance(a, dict):
+        c.attempt_id = a["attempt_id"]
+    else:
+        c.attempt_id = a.attempt_id
+    c.status = "released"; c.ended_utc = now(); c.error = "released without a call"
+    ledger.append(c)
 
 def close_attempt(ledger, a, status, error):
     """F6 close: supersede a completed attempt with an unparseable one (same
@@ -156,9 +266,6 @@ class StubClient:
     """No key, no network. Scripted behaviors per call, from a test script."""
     def __init__(self, script):
         self.script = script  # SHARED list: attempts pop from it in order
-    class Reply:
-        def __init__(self, d): self._d = d
-        def to_dict(self): return self._d
     def generate(self, model_id, prompt, cfg):
         if not self.script:
             raise RuntimeError("stub script exhausted")
@@ -170,6 +277,8 @@ class StubClient:
             raise TimeoutError("stub timeout")
         if action == "boom":          # unknown: billable-or-not undecidable
             raise RuntimeError("stub connection dropped mid-call")
+        if action == "throttle":
+            raise OciAdapter.Throttled("stub 429")
         if action == "badjson":
             return "here is prose, no json at all", None
         raise ValueError("bad stub action")
@@ -187,54 +296,74 @@ def parse_pair(text):
     return str(obj["instruction"]).strip(), str(obj["response"]).strip()
 
 class OciAdapter:
-    """The adapter Claude 2238 finding 5 asked for: .generate(model_id, prompt, cfg)
-    on top of the real client call shape generate.py uses. Cohere rides chat(),
-    llama rides generate_text(), text extracted from .data. The oci import stays
-    lazy so the stub path never needs the package."""
+    """The real OCI path, .generate(model_id, prompt, cfg) on top of the SDK client.
+    DOC-CHECKED against the OCI Python SDK docs (Instinct 0003), NOT yet run live:
+    - Llama and every other GENERIC family rides client.chat() with
+      GenericChatRequest(api_format=GENERIC, messages=[user message]); generate_text()
+      is documented without Llama 4 support and is NOT used.
+    - num_generations is pinned to 1 in the request; the reservation arithmetic
+      assumes one generation, and a config asking for more fails fast in main().
+    - the client is built with oci.retry.NoneRetryStrategy() so the SDK performs no
+      hidden retries: one runner attempt is one billed call.
+    - the reply is read from the real message field (choices[0].message.content for
+      GENERIC, chat_response.text for Cohere); a reply without that field is an
+      error, never a longest-string guess across the whole response.
+    - any usage object in the response is returned verbatim for reconciliation.
+    The oci import stays lazy so the stub path never needs the package."""
     def __init__(self, cfg):
         import oci
         conf = oci.config.from_file(profile_name=cfg.get("profile", "DEFAULT"))
         self.client = oci.generative_ai_inference.GenerativeAiInferenceClient(conf,
-            service_endpoint=f"https://inference.generativeai.{cfg['region']}.oci.oraclecloud.com")
+            service_endpoint=f"https://inference.generativeai.{cfg['region']}.oci.oraclecloud.com",
+            retry_strategy=oci.retry.NoneRetryStrategy())
         self.cfg = cfg
     class Throttled(Exception):
         pass
-    def _extract_text(self, data):
-        found = []
-        def walk(d):
-            if isinstance(d, str):
-                found.append(d)
-            elif isinstance(d, dict):
-                for v in d.values(): walk(v)
-            elif isinstance(d, list):
-                for v in d: walk(v)
-        walk(data.to_dict() if hasattr(data, "to_dict") else data)
-        if not found:
-            raise RuntimeError("no text found in reply")
-        return max(found, key=len)
+    def _reply_and_usage(self, data):
+        d = data.to_dict() if hasattr(data, "to_dict") else data
+        # GENERIC chat: ChatResult.data.choices[i].message.content
+        choices = d.get("choices") if isinstance(d, dict) else None
+        if choices:
+            msg = choices[0].get("message") or {}
+            text = msg.get("content")
+            if text:
+                return str(text), (d.get("usage") if isinstance(d.get("usage"), (dict, type(None))) else None)
+        # Cohere: ChatResult.data.chat_response.text
+        cr = d.get("chat_response") if isinstance(d, dict) else None
+        if isinstance(cr, dict):
+            text = cr.get("text")
+            if text:
+                return str(text), (cr.get("usage") if isinstance(cr.get("usage"), (dict, type(None))) else None)
+        raise RuntimeError("reply arrived without a message text field; refusing to "
+                           f"guess. keys: {sorted(d.keys()) if isinstance(d, dict) else type(d).__name__}")
     def generate(self, model_id, prompt, cfg):
         import oci
+        if int(cfg.get("num_generations", 1)) != 1:
+            raise ValueError("num_generations must be 1: the reservation arithmetic "
+                             "covers one generation only, and every extra generation bills")
         if model_id.startswith("cohere"):
             detail = oci.generative_ai_inference.models.ChatDetails()
             detail.serving_mode = oci.generative_ai_inference.models.OnDemandServingMode(model_id=model_id)
             detail.chat_request = oci.generative_ai_inference.models.CohereChatRequest(
                 message=prompt, max_tokens=cfg["max_tokens"], temperature=cfg["temperature"])
         else:
-            detail = oci.generative_ai_inference.models.GenerateTextDetails()
+            detail = oci.generative_ai_inference.models.ChatDetails()
             detail.serving_mode = oci.generative_ai_inference.models.OnDemandServingMode(model_id=model_id)
-            detail.inference_request = oci.generative_ai_inference.models.LlamaLlmInferenceRequest(
-                prompt=prompt, max_tokens=cfg["max_tokens"], temperature=cfg["temperature"])
+            msg = oci.generative_ai_inference.models.Message(role="USER", content=[{"type": "TEXT", "text": prompt}])
+            detail.chat_request = oci.generative_ai_inference.models.GenericChatRequest(
+                api_format=oci.generative_ai_inference.models.GenericChatRequest.API_FORMAT_GENERIC,
+                messages=[msg], max_tokens=cfg["max_tokens"], temperature=cfg["temperature"],
+                num_generations=1)
         detail.compartment_id = cfg["compartment_id"]
         try:
-            if model_id.startswith("cohere"):
-                return self._extract_text(self.client.chat(detail).data), None
-            return self._extract_text(self.client.generate_text(detail).data), None
+            result = self.client.chat(detail)
+            return self._reply_and_usage(result.data)
         except oci.exceptions.ServiceError as e:
             if e.status == 429:
                 raise OciAdapter.Throttled(str(e))
             raise
 
-def build_client(cfg):  # real path (stage 1+): region from config, adapter restores .generate
+def build_client(cfg):  # real path (stage 1+): region from config, adapter provides .generate
     return OciAdapter(cfg)
 
 def pick_model(cfg, seed_id, ledger_rows):
@@ -243,12 +372,24 @@ def pick_model(cfg, seed_id, ledger_rows):
         raise ValueError("empty allow-list")
     for r in ledger_rows:               # deterministic resume: same seed, same model
         if r["seed_id"] == seed_id:
-            if r["status"] == "pending":
+            if r["status"] in ("pending", "claimed"):
                 return None             # another worker holds this pair in flight
-            if r["status"] in ("completed","unknown","timeout","failed"):
+            if r["status"] in SPENT_STATUSES + ("unparseable",):
                 return r["model"]
     ids = sorted(allowed)
     return ids[stable_slot(seed_id, len(ids))]
+
+def acquire_run_lock(ledger_path):
+    """One-worker enforcement as code (Instinct 0003 item 5): a non-blocking
+    exclusive flock on <ledger>.runlock held for the process lifetime. Returns the
+    open fd the caller must keep, or None when another worker already holds it."""
+    fd = open(ledger_path + ".runlock", "a")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except OSError:
+        fd.close()
+        return None
 
 def load_seed_ids(out_path):
     done = set()
@@ -269,10 +410,20 @@ def main():
     ap.add_argument("--max-attempts", type=int, default=0,
                     help="hard cumulative cap on raw attempts, read from the ledger")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--max-retries", type=int, default=None,
+                    help="bounded retries per pair after a 429; default from config")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     cfg = json.load(open(args.config))
     cfg["run_id"] = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    if int(cfg.get("num_generations", 1)) != 1:
+        sys.exit("config sets num_generations != 1: the reservation covers one "
+                 "generation; every extra generation multiplies the bill")
+    run_lock_fd = acquire_run_lock(cfg["ledger_path"])
+    if run_lock_fd is None:
+        sys.stderr.write("another runner process holds the run lock on this ledger; "
+                         "exiting without booking anything (one-worker rule)\n")
+        sys.exit(2)
     ledger = Ledger(cfg["ledger_path"])
     price = cfg.get("price_per_million_chars", 0.18)
     spent = ledger.spent_chars(); cost = spent / 1e6 * price
@@ -292,61 +443,122 @@ def main():
     max_out_chars = cfg.get("max_chars_per_token", 113) * cfg["max_tokens"]
     if not cfg.get("attempt_char_cap"):
         sys.exit("config needs attempt_char_cap: the per-attempt reservation ceiling in "
-                 "chars, at least input bytes + the reply term (113 x max_tokens = 115,712 "
-                 "bytes at 1,024 tokens; about 116,712 with a 1,000-byte prompt)")
+                 "chars, at least input bytes + overhead + the reply term (113 x max_tokens "
+                 "= 115,712 bytes at 1,024 tokens)")
+    overhead = int(cfg.get("prompt_overhead_chars", 200))
+    max_retries = args.max_retries if args.max_retries is not None else int(cfg.get("max_retries", 2))
     os.makedirs(os.path.dirname(cfg["out_path"]) or ".", exist_ok=True)
     seeds_done = load_seed_ids(cfg["out_path"])
     n_max = args.limit if args.limit else 10**9
     made = 0
+    skipped_status = {}
+    cap_refusals = 0
+    held_seen = []
+    budget_hit = attempts_cap_hit = False
     for seed in cfg_seeds(cfg):
-        if made >= n_max:
+        if made >= n_max or budget_hit or attempts_cap_hit:
             break
+        # Prompt-pack gate (Instinct 0010): only execution_status="eligible" rows run.
+        st = seed.get("execution_status", "eligible")
+        if st != "eligible":
+            skipped_status[st] = skipped_status.get(st, 0) + 1
+            continue
+        if cfg.get("require_rendered_prompt") and not seed.get("prompt"):
+            sys.exit(f"seed {seed.get('id')} has no rendered prompt field and "
+                     "require_rendered_prompt is set; refusing to run a template prompt")
+        prompt = seed.get("prompt") or f"prompt for {seed['topic']} (pair 1)"
+        prompt_source = "rendered" if seed.get("prompt") else "template"
         for k in range(seed.get("n_pairs", cfg.get("pairs_per_seed", 4))):
-            # Rows are keyed by the bare seed id, and a closing row supersedes its
-            # reservation: effective_rows(), not rows(), or the pending row wins.
+            if made >= n_max or budget_hit or attempts_cap_hit:
+                break
             model_id = pick_model(cfg, seed["id"], ledger.effective_rows())
             if model_id is None:
+                held_seen.append(f"{seed['id']} (held by another worker)")
                 continue                    # another worker holds this seed in flight
             rec_id = f"{seed['id']}#{k+1}#{model_id.rsplit('.',1)[-1][:24]}"
             if rec_id in seeds_done: continue
             if args.max_attempts and ledger.attempts() >= args.max_attempts:
-                break
+                attempts_cap_hit = True; break
             if ledger.spent_chars() + cfg["attempt_char_cap"] > budget_chars:
+                budget_hit = True; break
+            # Bounded 429 retry: each retry is a NEW reserved attempt, never a
+            # silent repeat of the same one (Instinct 0007 item 3).
+            for try_n in range(max_retries + 1):
+                claim = claim_seed(cfg, seed["id"], model_id, ledger)
+                if claim is None:
+                    held_seen.append(f"{seed['id']} (held by another worker)")
+                    break
+                try:
+                    a, reply = run_once(cfg, lambda: build_client(cfg), seed, model_id,
+                                        prompt, ledger, max_out_chars=max_out_chars,
+                                        attempt_row=claim, overhead_chars=overhead)
+                except OciAdapter.Throttled:
+                    if try_n < max_retries:
+                        time.sleep(min(0.5 * (2 ** try_n), 8.0))
+                        continue
+                    break
+                except Exception:
+                    release_claim(ledger, claim.row())
+                    raise
+                if isinstance(a, dict) and a.get("status") == "refused_cap":
+                    cap_refusals += 1
+                    release_claim(ledger, claim.row())
+                    print(f"cap refusal: {a['error']}")
+                    break
+                if a is None or reply is None or a.status != "completed":
+                    break
+                # F6 parse-and-filter (Claude 2238 #6): a pair counts as MADE only when it
+                # parses and clears the length floor. An unparseable or too-short reply
+                # closes its attempt as "unparseable" and inflates nothing.
+                try:
+                    instr, resp = parse_pair(reply)
+                except (ValueError, json.JSONDecodeError) as e:
+                    close_attempt(ledger, a.row(), "unparseable", f"parse: {e}")
+                    break
+                if len(instr.encode("utf-8")) < 15 or len(resp.encode("utf-8")) < 15:
+                    close_attempt(ledger, a.row(), "unparseable", "below 15-byte floor")
+                    break
+                rec = {
+                    "id": rec_id,
+                    "instruction": instr,
+                    "response": resp,
+                    "source": "synthetic",
+                    "language": seed.get("language"),
+                    "split": seed.get("split"),
+                    "prompt_source": prompt_source,
+                    "seed": {kk: vv for kk, vv in seed.items() if kk not in ("prompt",)},
+                    "generator": {
+                        "model": model_id,
+                        "template": cfg.get("template", "pair-from-topic-v1"),
+                        "temperature": cfg["temperature"],
+                        "max_tokens": cfg["max_tokens"],
+                        "num_generations": 1,
+                        "prompt_overhead_chars": overhead,
+                    },
+                    "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                }
+                with open(cfg["out_path"], "a", encoding="utf-8") as out:
+                    out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    out.flush()
+                seeds_done.add(rec_id)
+                made += 1
                 break
-            prompt = f"prompt for {seed['topic']} (pair {k+1})"
-            a, reply = run_once(cfg, lambda: build_client(cfg), seed, model_id, prompt, ledger,
-                                max_out_chars=max_out_chars)
-            if a is None or reply is None or a.status != "completed":
-                continue
-            # F6 parse-and-filter (Claude 2238 #6): a pair counts as MADE only when it
-            # parses and clears the length floor. An unparseable or too-short reply
-            # closes its attempt as "unparseable" and inflates nothing.
-            try:
-                instr, resp = parse_pair(reply)
-            except (ValueError, json.JSONDecodeError) as e:
-                close_attempt(ledger, a.row(), "unparseable", f"parse: {e}")
-                continue
-            if len(instr.encode("utf-8")) < 15 or len(resp.encode("utf-8")) < 15:
-                close_attempt(ledger, a.row(), "unparseable", "below 15-byte floor")
-                continue
-            rec = {
-                "id": rec_id,
-                "instruction": instr,
-                "response": resp,
-                "source": "synthetic",
-                "generator": {
-                    "model": model_id,
-                    "template": cfg.get("template", "pair-from-topic-v1"),
-                    "temperature": cfg["temperature"],
-                    "max_tokens": cfg["max_tokens"],
-                },
-                "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            }
-            with open(cfg["out_path"], "a", encoding="utf-8") as out:
-                out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                out.flush()
-            seeds_done.add(rec_id)
-            made += 1
+    # Held seeds are LISTED, never auto-released (Instinct 0002 item 3): a person
+    # reconciles each against Oracle's usage view before the seed unblocks.
+    held = sorted({r["seed_id"] for r in ledger.effective_rows() if r["status"] in HELD_STATUSES})
+    closed_unretried = sorted({r["seed_id"] for r in ledger.effective_rows()
+                               if r["status"] in ("unknown","timeout","unparseable")})
+    if skipped_status:
+        print(f"skipped rows by execution_status: "
+              f"{', '.join(f'{k}={v}' for k, v in sorted(skipped_status.items()))}")
+    if cap_refusals:
+        print(f"cap refusals (nothing sent): {cap_refusals}")
+    if held:
+        print(f"held seeds awaiting manual reconciliation against Oracle's usage view: "
+              f"{', '.join(held)}")
+    if closed_unretried:
+        print(f"closed attempts NOT auto-retried (unknown/timeout/unparseable; lead rule, "
+              f"no silent re-bill): {', '.join(closed_unretried)}")
     note = "" if ledger.attempts() else (" (no attempts booked: seeds empty, budget "
                                          "exhausted, or cap already reached)")
     print(f"done: run {cfg['run_id']} made {made} pairs; ledger {ledger.attempts()} attempts, "

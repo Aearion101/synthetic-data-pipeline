@@ -20,6 +20,7 @@ Grok stays out of this pipeline by decision: xAI's terms bar helping rivals.
 """
 import argparse
 import json
+import os
 import random
 import re
 import sys
