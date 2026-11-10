@@ -11,9 +11,22 @@ Fixes implemented vs repo generate.py (Aearion101/synthetic-data-pipeline HEAD):
  to client construction and validated on first authenticated call (stub test covers
  the path); 9 no Cohere ids accepted (allow-list refuses); 10 README wording is a
  repo edit, not done here.
-Oracle bills prompt+response characters (Instinct 2020): input chars counted exactly,
- response chars counted from the returned text, and any usage field the response
- returns is recorded verbatim for reconciliation against Oracle's usage view.
+Oracle bills prompt+response characters (Instinct 2020): input chars counted as
+ UTF-8 bytes, response chars counted from the returned text, and any usage field the
+ response returns is recorded verbatim for reconciliation against Oracle's usage view.
+
+Fixes from the independent PR #1 reviews (DeepSeek 2235/2236, Claude 2238/2241) and
+ Instinct 2146:
+ 11 the pre-call reservation is real: output_chars = 113 x max_tokens before the call;
+    a pending/timeout/unknown/failed attempt keeps its FULL reservation, only a
+    completed row settles it to the actual count (the prompt-only undercharge is gone);
+ 12 resume key fixed: rows keyed by the bare seed id, lookups use effective_rows()
+    (close wins), a held seed is skipped, and a None model can no longer crash main();
+ 13 the client is built and interface-checked outside the try, before the reservation
+    row: misconfiguration raises, the ledger never books an attempt that never ran;
+ 14 main() fails fast when attempt_char_cap is absent from the config (DeepSeek F6).
+ Still open by the lead's call (DeepSeek 2235): F1 record writer, F5 OCI adapter,
+    F6 badjson-as-made, F7 retry policy.
 """
 import argparse, hashlib, json, os, sys, time, uuid
 from datetime import datetime, timezone
@@ -71,19 +84,33 @@ class Ledger:
         return len(self.effective_rows())
 
 def record_chars(text):  # exact count of billed characters, prompt+response
-    return len(text)
+    # A byte-billed service counts UTF-8 bytes; in Thai/Arabic/Indonesian seeds
+    # one code point is 2-3 bytes, so len() under-reserves the input term by up
+    # to 3x. Read as bytes; the reply term is separately bounded by 113 x max_tokens.
+    return len(text.encode("utf-8"))
 
 def run_once(cfg, client_factory, seed, model_id, prompt, ledger, max_out_chars=None):
     """One attempt: reserve, call, close the row. Returns the row's final status."""
-    if max_out_chars and len(prompt) > 0:  # reservation uses input chars exactly
-        pass
     a = Attempt(cfg["run_id"], seed["id"], model_id)
     a.input_chars = record_chars(prompt)
     if max_out_chars and a.input_chars + max_out_chars > cfg["attempt_char_cap"]:
         return None  # caller handles pre-call cap refusal
+    # Build and interface-check the client OUTSIDE the try, before the reservation
+    # row exists: a missing oci package, missing credentials or a client without
+    # .generate is a misconfiguration, not possible spend, so it must raise instead
+    # of being booked as "unknown" (Claude 2238 finding 5).
+    client = client_factory()
+    if not hasattr(client, "generate"):
+        raise TypeError(
+            f"client for {model_id} has no .generate(model_id, prompt, cfg); "
+            "the real OCI path needs a chat()/generate_text() adapter (stage 1+)")
+    # Reserve the reply term before the call. An attempt whose outcome is unknown
+    # keeps this reservation; only a completed row settles it to the actual count.
+    # (committed = settled if settled else reserved)
+    a.output_chars = max_out_chars or 0
     ledger.append(a)                       # reservation BEFORE the call
     try:
-        reply, usage = client_factory().generate(model_id, prompt, cfg)
+        reply, usage = client.generate(model_id, prompt, cfg)
         a.output_chars = record_chars(reply)
         a.usage = usage
         a.status = "completed"; a.ended_utc = now()
@@ -170,11 +197,22 @@ def main():
     if attempts and args.max_attempts and attempts >= args.max_attempts:
         print(f"cap already reached across runs: {attempts} >= {args.max_attempts}"); return
     budget_chars = cfg["budget_usd"] / price * 1e6
+    # Bound the reply term before the call: the longest Llama-4 token decodes to
+    # 113 characters (DeepSeek 2137), so a reply of max_tokens tokens is at most
+    # 113 x max_tokens characters.
+    max_out_chars = cfg.get("max_chars_per_token", 113) * cfg["max_tokens"] if cfg.get("max_tokens") else None
+    if not cfg.get("attempt_char_cap"):
+        sys.exit("config needs attempt_char_cap: the per-attempt reservation ceiling in "
+                 "chars, at least input bytes + 113 x max_tokens (116,712 at 1,024 tokens)")
     seeds_done = load_seed_ids(cfg["out_path"])
     made = 0
     for seed in cfg_seeds(cfg):
         for k in range(seed.get("n_pairs", cfg.get("pairs_per_seed", 4))):
-            model_id = pick_model(cfg, f"{seed['id']}#{k+1}", ledger.rows())
+            # Rows are keyed by the bare seed id, and a closing row supersedes its
+            # reservation: effective_rows(), not rows(), or the pending row wins.
+            model_id = pick_model(cfg, seed["id"], ledger.effective_rows())
+            if model_id is None:
+                continue                    # another worker holds this seed in flight
             rec_id = f"{seed['id']}#{k+1}#{model_id.rsplit('.',1)[-1][:24]}"
             if rec_id in seeds_done: continue
             if args.max_attempts and ledger.attempts() >= args.max_attempts:
@@ -182,7 +220,8 @@ def main():
             if ledger.spent_chars() + cfg["attempt_char_cap"] > budget_chars:
                 break
             prompt = f"prompt for {seed['topic']} (pair {k+1})"
-            a = run_once(cfg, lambda: build_client(cfg), seed, model_id, prompt, ledger)
+            a = run_once(cfg, lambda: build_client(cfg), seed, model_id, prompt, ledger,
+                         max_out_chars=max_out_chars)
             if a and a.status == "completed":
                 made += 1
     print(f"done: run {cfg['run_id']} made {made} pairs; ledger {ledger.attempts()} attempts, "
