@@ -155,6 +155,14 @@ class Ledger:
     def _append_unlocked(self, row):
         blob = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
         with open(self.path, "a", encoding="utf-8") as fh:
+            # Another worker may hold appends our cache never saw: its rows sit
+            # between our cached offset and the file's real end. Parse that gap
+            # into the cache BEFORE our write and before the offset can move past
+            # it, so a claim after this append can never grant a pair another
+            # worker already holds (Instinct 0349: cross-process double claim
+            # from the tail cache; reviewer-reproduced).
+            if self._rows is not None and os.path.getsize(self.path) > self._offset:
+                self._read_lines(self._offset)     # advances _offset over the gap
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
             fh.flush(); os.fsync(fh.fileno())
         # The writer's own bytes are known: extend the cache instead of dropping
@@ -380,12 +388,17 @@ class StubClient:
         raise ValueError("bad stub action")
 
 def parse_pair(text):
-    """generate.py's parse: first JSON object in the reply, both fields non-empty."""
+    """generate.py's parse: first JSON object in the reply, both fields non-empty.
+    Tolerant (strict=False): literal line feeds inside string values parse."""
     import re
     m = re.search(r"\{", text)
     if not m:
         raise ValueError("no JSON object in reply")
-    obj, _ = json.JSONDecoder().raw_decode(text[m.start():])
+    # strict=False (Claude 0341 F1, Instinct 0346/0349 ruling): a literal line
+    # break inside a string value is common in real replies (code blocks,
+    # lists, dialogue) and fatal to a strict parser. Tolerant decoding accepts
+    # JSON a strict parser would reject; json.dumps re-escapes on the way out.
+    obj, _ = json.JSONDecoder(strict=False).raw_decode(text[m.start():])
     if not (isinstance(obj, dict) and str(obj.get("instruction", "")).strip()
             and str(obj.get("response", "")).strip()):
         raise ValueError("bad pair shape")

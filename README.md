@@ -14,6 +14,10 @@ says. Format conversion happens at tune time, not at generation.
     python3 generate.py --config gen_config.json
     python3 dedupe.py data/batch_001.jsonl data/batch_001.clean.jsonl
 
+    # test suite (no key, no network): T22 needs the oci SDK installed; without
+    # it the SDK-shape test reports sdk_ok=None and fails (Instinct 0346)
+    python3 test_stage0.py
+
 Auth is the standard OCI SDK path (~/.oci/config, OCI_CLI_* env vars, or instance
 principals). Execution is gated on Dylan handing the OCI keys via secure link; nobody
 creates new accounts or keys.
@@ -27,6 +31,11 @@ creates new accounts or keys.
   so provenance stays clean end to end.
 - Resumable: a rerun skips pair ids already in the output file, so an interrupted batch
   continues instead of duplicating.
+- Tolerant JSON parsing: the pair parser (parse_pair, both runner_v2.py and
+  generate.py) uses json.JSONDecoder(strict=False), so a reply with a literal line
+  break inside a string value (code blocks, lists, dialogue) parses where a strict
+  parser would raise; json.dumps re-escapes output on the way out (Claude 0341 F1,
+  Instinct 0346/0349).
 - Budget-aware: counts sent + received characters and prices them against the config rate
   (cheap Llama is about $0.18 per million characters), printing a running estimate and
   stopping at the configured budget.

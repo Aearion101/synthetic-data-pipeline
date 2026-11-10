@@ -535,18 +535,19 @@ def suite():
     check("T25 a corrupt complete line still raises (fail loud, never guess)", raised)
 
     # T26 (Fo 0245 addendum item 1): the shipped one-stage config cannot refuse its
-    # own rows. The longest one-stage render is 922 bytes (ChatGPT 0308); at
-    # max_tokens 1024 the reply term is 113 x 1024 = 115,712; with the 200-char
-    # overhead the worst attempt is 922 + 200 + 115,712 = 116,834 <= 120,000, so
-    # the shipped config produces NO zero-call green exit from cap refusals.
+    # own rows. The longest one-stage render in pack v2 is 1,041 bytes (Instinct
+    # 0350, ChatGPT 0401; v1's was 922); at max_tokens 1024 the reply term is
+    # 113 x 1024 = 115,712; with the 200-char overhead the worst attempt is
+    # 1,041 + 200 + 115,712 = 116,953 <= 120,000, so the shipped config produces
+    # NO zero-call green exit from cap refusals.
     cfg = fresh({"attempt_char_cap": 120000, "max_tokens": 1024})
     cfg["run_id"] = "t26"
     seed = {"id": "seed-t26", "topic": "rain"}
-    prompt = "x" * 922
+    prompt = "x" * 1041
     a, reply = R.run_once(cfg, lambda: SpyClient(["ok"]), seed, "alpha.model", prompt,
                           R.Ledger(cfg["ledger_path"]), max_out_chars=113 * cfg["max_tokens"],
                           overhead_chars=200)
-    check("T26 longest one-stage row (922 bytes) is NOT refused_cap at 1024/120000",
+    check("T26 longest one-stage row (1,041 bytes) is NOT refused_cap at 1024/120000",
           a.status == "completed", f"status={a.status} error={getattr(a, 'error', None)}")
     refused_total = a.input_chars + 113 * cfg["max_tokens"]
     check("T26 shipped-config arithmetic stays under the cap",
@@ -595,7 +596,8 @@ def suite():
 
     # T29 (Fo 0245 addendum item 1): the shipped example config itself states the
     # one-stage shape: one pair per row, the one-stage template label, and the
-    # numbers DeepSeek 0236 measured (1024 fits the 120,000 cap on 922 bytes).
+    # numbers DeepSeek 0236 measured (1024 fits the 120,000 cap on the pack v2
+    # longest row, 1,041 bytes: 1,041 + 200 + 115,712 = 116,953).
     ecfg = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                        "gen_config.example.json")))
     check("T29 shipped config: pairs_per_seed 1 and the one-stage template label",
@@ -603,8 +605,56 @@ def suite():
           f"pairs={ecfg.get('pairs_per_seed')} template={ecfg.get('template')}")
     check("T29 shipped config: max_tokens 1024 fits attempt_char_cap 120000",
           ecfg.get("max_tokens") == 1024 and ecfg.get("attempt_char_cap") == 120000
-          and 922 + 200 + 113 * 1024 <= ecfg["attempt_char_cap"],
+          and 1041 + 200 + 113 * 1024 <= ecfg["attempt_char_cap"],
           f"max_tokens={ecfg.get('max_tokens')} cap={ecfg.get('attempt_char_cap')}")
+
+    # T30 (Claude 0341 F1, Instinct 0346/0349 ruling): tolerant JSON decoding.
+    # A literal line feed inside "response" is invalid to a strict parser but
+    # common in real replies (code blocks, lists, dialogue). parse_pair uses
+    # json.JSONDecoder(strict=False) so those replies parse; the structural
+    # checks are unchanged and json.dumps re-escapes on the way out.
+    tricky = '{"instruction":"list three","response":"line one\nline two"}'
+    obj = None
+    try:
+        obj = R.parse_pair(tricky)
+    except Exception as ex:
+        obj = f"raised: {ex}"
+    check("T30 literal line feed inside response parses under strict=False",
+          obj == ("list three", "line one\nline two"), f"got {obj!r}")
+    # a strict parser really would refuse the same bytes: the tolerance is real,
+    # not an accidentally-permissive shape.
+    strict_raised = False
+    try:
+        json.JSONDecoder().raw_decode(tricky)
+    except json.JSONDecodeError:
+        strict_raised = True
+    check("T30 the same bytes fail a strict decoder (tolerance is the change)",
+          strict_raised)
+
+    # T31 (Instinct 0349, reviewer-reproduced): cross-process double claim from
+    # the ledger tail cache. L1 caches an offset; L2 claims pair seed-1#1; L1
+    # then appends an unrelated row. The old append advanced L1's cached offset
+    # past L2's unread row, so L1's next claim could grant an already-held pair.
+    # The fix re-reads the gap between the cached offset and the real file size
+    # under the same flock BEFORE the write moves the offset past it.
+    cfg = fresh(); cfg["run_id"] = "t31"
+    path = cfg["ledger_path"]
+    l1 = R.Ledger(path); l1.rows()          # L1 caches the empty file
+    l2 = R.Ledger(path); l2.rows()          # L2 caches the same file
+    c2 = R.Attempt("other-run", "seed-1", "zeta.model")
+    c2.status = "claimed"; c2.pair_key = "seed-1#1"
+    l2.append(c2.row())                     # L2 claims the pair
+    other = R.Attempt("other-run", "seed-9", "zeta.model")
+    other.status = "completed"
+    l1.append(other.row())                  # L1 appends an unrelated row
+    got = R.claim_seed(cfg, "seed-1#1", "alpha.model", l1)
+    check("T31 tail-cache gap re-read: L1 cannot double-claim a held pair",
+          got is None, f"claim granted: {got.row() if got else None}")
+    # and L1's cache is whole again: both rows visible through the cached read
+    check("T31 L1's cached rows include L2's claim after the append",
+          any(r.get("pair_key") == "seed-1#1" and r["status"] == "claimed"
+              for r in l1.rows()),
+          f"rows={len(l1.rows())}")
 
 def worker(cfg, n, q):
     """Same five seeds from two workers. Config arrives as an argument so the

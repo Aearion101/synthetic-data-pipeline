@@ -110,7 +110,10 @@ def parse_pair(text):
     m = re.search(r"\{", text)
     if not m:
         raise ValueError("no JSON object in reply")
-    obj, _ = json.JSONDecoder().raw_decode(text[m.start():])
+    # strict=False (Claude 0341 F1, Instinct 0346/0349 ruling): tolerant
+    # decoding accepts JSON a strict parser would reject; json.dumps
+    # re-escapes output on the way out.
+    obj, _ = json.JSONDecoder(strict=False).raw_decode(text[m.start():])
     if not (isinstance(obj, dict) and str(obj.get("instruction", "")).strip()
             and str(obj.get("response", "")).strip()):
         raise ValueError("bad pair shape")
