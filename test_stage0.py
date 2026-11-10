@@ -6,10 +6,11 @@ rather than reading a module global (Instinct 2145/2146, DeepSeek 2140/2235/2334
 Covers Instinct 2020's five asks, the independent-review regression sets
 (DeepSeek 2235/2236/2335, Claude 2238/2241/2235: T1/T2 corrected assertions,
 N6 fail-fast, F6 parse-and-filter), and main()'s own path via a spy client
-factory. Known-red check: T11 asserts at most one attempt per seed across
-workers, which cannot hold without a cross-process ledger lock; it is marked
-expected-failure with that reason and stays red until the lock lands
-(DeepSeek 2137 spend_cap flock, lead's call on the rail)."""
+factory. The Instinct 0048 round (DeepSeek 0038's review of 42cad8e): T21
+unparseable spend accounting, T22 the real SDK reply shape (ChatResult ->
+GenericChatResponse -> list-of-ChatContent content), T23 pair-scoped claim
+keys, T24 the incremental ledger tail parse. T14's lock-holder process target
+is module level so the suite really is spawn-safe as this docstring claims."""
 import json, os, subprocess, sys, tempfile, multiprocessing, fcntl
 
 import runner_v2 as R
@@ -158,9 +159,14 @@ def suite():
     run_main(cfg, ["boom"])
     held = R.Attempt("w2", "held-seed", cfg["models"][0]["model_id"])
     held.input_chars = 1000; held.output_chars = MAX_OUT
+    held.pair_key = "held-seed#1"
     l2 = R.Ledger(cfg["ledger_path"]); l2.append(held)
-    check("T2b pending reservation blocks same seed (close-wins lookup)",
-          R.pick_model(cfg, "held-seed", l2.effective_rows()) is None)
+    check("T2b pending reservation blocks its own pair (close-wins lookup)",
+          R.pick_model(cfg, "held-seed", l2.effective_rows(), "held-seed#1") is None)
+    slot_model = sorted(m["model_id"] for m in cfg["models"])[R.stable_slot("held-seed", 2)]
+    check("T2b a pending pair does not block the seed's other pairs (pair-scoped)",
+          R.pick_model(cfg, "held-seed", l2.effective_rows(), "held-seed#2") == slot_model,
+          f"got={R.pick_model(cfg, 'held-seed', l2.effective_rows(), 'held-seed#2')} want={slot_model}")
     check("T2b closed attempt resumes to its own model (two-model allow-list)",
           R.pick_model(cfg, "seed-00001", l2.effective_rows()) == "alpha.model")
 
@@ -216,9 +222,15 @@ def suite():
     held = R.Attempt("w0", "seed-00001", cfg["models"][0]["model_id"])
     held.input_chars = 1000; held.output_chars = MAX_OUT
     l.append(held)
-    calls = run_main(cfg, [PAIR])
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        calls = run_main(cfg, [PAIR])
     check("T7 main() skips a seed held pending by another worker (no call made)", calls == [],
           f"calls={len(calls)}")
+    check("T7 the skipped pair is NAMED at run end, never silently dropped",
+          "pairs skipped this run" in buf.getvalue() and "seed-00001#1" in buf.getvalue(),
+          f"out={buf.getvalue()[-200:]!r}")
 
     # T8: a client without .generate raises before the reservation row exists
     cfg = fresh(); write_seeds(cfg, 1)
@@ -306,12 +318,6 @@ def suite():
           second is None, f"second={second}")
     fcntl.flock(fd, fcntl.LOCK_UN); fd.close()
     q2 = multiprocessing.Queue()
-    def holder(path, qu):
-        import runner_v2 as RR
-        f = RR.acquire_run_lock(path)
-        qu.put("held" if f else "none")
-        import time; time.sleep(2)
-        if f: fcntl.flock(f, fcntl.LOCK_UN); f.close()
     ph = multiprocessing.Process(target=holder, args=(cfg["ledger_path"], q2))
     ph.start(); import time as _t; _t.sleep(0.5)
     check("T14 cross-process: child holds, parent refuses",
@@ -398,6 +404,130 @@ def suite():
           len(eff) == 2 and len(out_recs(cfg["out_path"])) == 1,
           f"attempts={len(eff)} recs={len(out_recs(cfg['out_path']))}")
 
+    # T21 (DeepSeek 0038 R2): an unparseable reply is a real charge with no pair
+    cfg = fresh(); write_seeds(cfg, 1)
+    run_main(cfg, ["badjson"])
+    l = R.Ledger(cfg["ledger_path"])
+    eff = [x for x in l.effective_rows() if x["status"] == "unparseable"]
+    check("T21 unparseable keeps its chars in the spend counter (never est $0.00 after a call)",
+          l.attempts() == 1 and eff
+          and l.spent_chars() == eff[0]["input_chars"] + eff[0]["output_chars"],
+          f"attempts={l.attempts()} spent={l.spent_chars()} "
+          f"expected={eff[0]['input_chars'] + eff[0]['output_chars'] if eff else None}")
+
+    # T22 (Instinct 0048 B): the reply is read from the REAL SDK shape:
+    # ChatResult.chat_response (GenericChatResponse) -> choices[0].message.content,
+    # a LIST of ChatContent (TextContent), not a plain string. The dict-shape and
+    # list-content cases always run; the built-from-oci-classes case runs when the
+    # package is present (skipped honestly when it is not).
+    def fake_data(d):
+        return type("FakeData", (), {"to_dict": lambda self: d})()
+    ad = object.__new__(R.OciAdapter); ad.cfg = {}
+    got, usage = ad._reply_and_usage(fake_data({
+        "chat_response": {"api_format": "GENERIC",
+            "choices": [{"index": 0, "message": {"role": "ASSISTANT",
+                "content": [{"type": "TEXT", "text": "the real reply"}]},
+                "finish_reason": "stop"}],
+            "usage": {"completion_tokens": 7}}}))
+    check("T22 GENERIC reply from chat_response.choices[0].message.content (dict shape)",
+          got == "the real reply" and usage == {"completion_tokens": 7},
+          f"got={got!r} usage={usage!r}")
+    got3, _ = ad._reply_and_usage(fake_data({
+        "choices": [{"message": {"content": [{"type": "TEXT", "text": "part one "},
+                                             {"type": "IMAGE", "url": "x"},
+                                             {"type": "TEXT", "text": "part two"}]}}]}))
+    check("T22 content list of TEXT parts unwraps in order, non-TEXT skipped",
+          got3 == "part one part two", f"got={got3!r}")
+    refused2 = False
+    try:
+        ad._reply_and_usage(fake_data({"choices": [{"message": {"content": []}}]}))
+    except RuntimeError as e:
+        refused2 = "refusing to guess" in str(e)
+    check("T22 an empty content list still refuses to guess", refused2)
+    sdk_ok = None
+    try:
+        import oci
+        m = oci.generative_ai_inference.models
+        res = m.ChatResult(model_id="meta.llama-4-scout-17b-16e-instruct")
+        ch = m.ChatChoice(index=0, finish_reason="stop",
+                          message=m.Message(role="ASSISTANT",
+                                            content=[m.TextContent(text="sdk-shaped reply")]))
+        res.chat_response = m.GenericChatResponse(
+            api_format=m.GenericChatResponse.API_FORMAT_GENERIC, choices=[ch],
+            usage=m.Usage(completion_tokens=7))
+        got2, usage2 = ad._reply_and_usage(res)
+        sdk_ok = (got2 == "sdk-shaped reply"
+                  and isinstance(usage2, dict) and usage2.get("completion_tokens") == 7)
+    except ImportError:
+        pass
+    check("T22 reply extraction on the real SDK model classes (oci present; None = oci missing)",
+          sdk_ok is True, f"sdk_ok={sdk_ok}")
+
+    # T23 (Instinct 0048 A): pair-scoped claims - pairs 2..N of a seed run after
+    # pair 1 completes, and neither a second fire nor a direct re-claim re-bills.
+    cfg = fresh({"pairs_per_seed": 4}); write_seeds(cfg, 1)
+    run_main(cfg, [PAIR] * 8)
+    l = R.Ledger(cfg["ledger_path"])
+    eff = l.effective_rows()
+    pks = sorted({r.get("pair_key") for r in eff if r["status"] == "completed"})
+    check("T23 all four pairs of one seed claim and complete (pair-scoped keys)",
+          len(out_recs(cfg["out_path"])) == 4
+          and pks == [f"seed-00001#{i}" for i in (1, 2, 3, 4)],
+          f"recs={len(out_recs(cfg['out_path']))} pks={pks}")
+    a1 = l.attempts()
+    run_main(cfg, [PAIR] * 8)
+    check("T23 second fire books no new attempt for any pair",
+          R.Ledger(cfg["ledger_path"]).attempts() == a1,
+          f"attempts={R.Ledger(cfg['ledger_path']).attempts()}")
+    l3 = R.Ledger(cfg["ledger_path"])
+    check("T23 the ledger itself refuses a re-claim of a completed pair",
+          R.claim_seed(cfg, "seed-00001#1", "alpha.model", l3) is None)
+
+    # T24 (DeepSeek 0038 R3): the ledger re-reads only appended bytes; another
+    # process's append under the lock is visible to the next claim without a
+    # full re-parse, and a partial trailing line never crashes the read.
+    cfg = fresh(); write_seeds(cfg, 1)
+    lp = cfg["ledger_path"]
+    l = R.Ledger(lp)
+    a1r = R.Attempt("r1", "s1", "alpha.model"); a1r.pair_key = "s1#1"; l.append(a1r)
+    n0 = len(l.rows())
+    other = R.Ledger(lp)
+    a2r = R.Attempt("r2", "s2", "zeta.model"); a2r.pair_key = "s2#1"
+    other.append(a2r)
+    l.refresh()
+    check("T24 tail refresh sees another process's append",
+          len(l.rows()) == n0 + 1 and l.rows()[-1]["seed_id"] == "s2",
+          f"rows={len(l.rows())}")
+    check("T24 a fresh Ledger's full parse agrees with the incremental view",
+          len(R.Ledger(lp).rows()) == len(l.rows()))
+    check("T24 a pending pair blocks only itself, not its sibling pairs",
+          R.claim_seed(cfg, "s2#1", "alpha.model", l) is None
+          and R.claim_seed(cfg, "s1#2", "alpha.model", l) is not None)
+    with open(lp, "a", encoding="utf-8") as fh:
+        fh.write('{"attempt_id": "half"')   # no trailing newline: a writer mid-append
+    l.refresh()
+    check("T24 a partial trailing line is left unparsed, not crashed on",
+          all(r.get("attempt_id") for r in l.rows()))
+
+    # T25 (spawn-run diagnosis 2026-11-11): a tail offset that no longer lands
+    # on a line boundary heals by one full re-parse instead of crashing the
+    # claim or silently skipping rows; a corrupt line mid-file still raises.
+    l2 = R.Ledger(lp)
+    l2.rows()                                  # cache at the file's true end
+    l2._offset += 40                           # force the offset mid-row
+    l2.refresh()
+    check("T25 a stale tail offset heals by full re-parse, no row skipped",
+          len(l2.rows()) == len(l.rows()) and all(r.get("attempt_id") for r in l2.rows()))
+    l3 = R.Ledger(lp)
+    with open(lp, "a", encoding="utf-8") as fh:
+        fh.write("not json\n")
+    raised = False
+    try:
+        l3.rows()
+    except json.JSONDecodeError:
+        raised = True
+    check("T25 a corrupt complete line still raises (fail loud, never guess)", raised)
+
 def worker(cfg, n, q):
     """Same five seeds from two workers. Config arrives as an argument so the
     spawned child does not re-run the suite."""
@@ -410,13 +540,23 @@ def worker(cfg, n, q):
         if model is None:
             continue                      # another worker holds this seed: skip, never bill null
         prompt = f"prompt for rain (pair 1)"
-        claim = R.claim_seed(cfg, sid, model, ledger)
+        claim = R.claim_seed(cfg, f"{sid}#1", model, ledger)
         if claim is None:
             continue                      # reserve-and-check lost the race: skip
         R.run_once(cfg, lambda: SpyClient(script), seed, model, prompt, ledger,
                    max_out_chars=113 * cfg["max_tokens"], attempt_row=claim,
                    overhead_chars=200)
     q.put(True)
+
+def holder(path, qu):
+    """T14's child: holds the run lock long enough for the parent to see the
+    refusal. Module level so a spawn child can unpickle the target (DeepSeek
+    0038 R1, Instinct 0048 D); a closure inside suite() cannot be pickled."""
+    import runner_v2 as RR
+    f = RR.acquire_run_lock(path)
+    qu.put("held" if f else "none")
+    import time; time.sleep(2)
+    if f: fcntl.flock(f, fcntl.LOCK_UN); f.close()
 
 if __name__ == "__main__":
     suite()

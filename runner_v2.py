@@ -52,7 +52,8 @@ Fixes from Instinct 0002/0003/0005/0007/0008/0010 (2026-11-11):
     runner's ledger is the only retry layer (one runner attempt = one billed call).
  22 reply extracted from the REAL message field (choices[0].message.content for
     GENERIC chat, chat_response.text for Cohere); a reply without that field is an
-    error, never a longest-string guess.
+    error, never a longest-string guess. (34 below widens this to the real
+    ChatResult shape and list content.)
  23 usage object recorded verbatim when the response carries one.
  24 one-worker enforcement is code: a non-blocking exclusive flock on
     <ledger>.runlock at startup; a second process exits non-zero and books nothing
@@ -61,7 +62,8 @@ Fixes from Instinct 0002/0003/0005/0007/0008/0010 (2026-11-11):
     takes the ledger flock, re-reads, and appends a "claimed" row before releasing,
     so two workers cannot bill the same seed; T2 runs green on this path.
  26 every ledger append takes the same flock (short hold) so appends from two
-    processes cannot interleave; effective_rows() is cached (no O(n^2) re-read).
+    processes cannot interleave; effective_rows() is cached between mutations, and
+    the parse is incremental (36 below), so total parsed rows grow O(N).
  27 cap refusal (input bytes + reply term over attempt_char_cap) returns a
     "refused_cap" sentinel; main() skips and logs it, no TypeError kills the run.
  28 a 429 closes its attempt as "throttled" (reservation kept, counted spent until
@@ -80,6 +82,22 @@ Fixes from Instinct 0002/0003/0005/0007/0008/0010 (2026-11-11):
     With cfg["require_rendered_prompt"], a row without prompt fails fast. Field
     names Fo committed to the producer: prompt, id, language, split,
     execution_status (extra keys ride into provenance verbatim).
+
+Fixes from Instinct 0048 + DeepSeek 0038 (the 42cad8e review round, 2026-11-11):
+ 33 claim keys are PAIR-SCOPED ("seedid#k", Instinct 0048 A): pair 1 completing
+    no longer silently blocks pairs 2..N of the same seed; skipped pairs are
+    NAMED at run end (held_seen printed), and the held/closed listings carry
+    the pair key for reconciliation.
+ 34 the reply walk reads the real response shape: ChatResult.chat_response ->
+    GenericChatResponse -> choices[0].message.content, whose content is a LIST
+    of ChatContent (TextContent.text), never str(list); shape-checked against
+    oci 2.191.0's own model classes without a live call (Instinct 0048 B).
+ 35 "unparseable" counts in SPENT_STATUSES: a parsed-but-unusable reply is a
+    real charge with no pair, never a zero in the stage-1 reconcile number
+    (DeepSeek 0038 R2, Instinct 0048 C).
+ 36 the ledger re-parses only appended bytes (Ledger.refresh()); the claim's
+    fresh read is a tail parse, so 16,000 attempts no longer cost ~28 minutes
+    of JSON parsing (DeepSeek 0038 R3; measured, not claimed).
  Still open: pending-row recovery for a killed worker (lead's call; listed at run
  end per 30 until then). Region, max_tokens enforcement and usage-view lag are
  stage-1 observations, not settled facts.
@@ -95,7 +113,7 @@ def stable_slot(seed_id, n):
 
 class Attempt:  # reservation row, written before the call
     FIELDS = ["attempt_id","run_id","seed_id","model","status","input_chars",
-              "output_chars","usage","started_utc","ended_utc","error"]
+              "output_chars","usage","started_utc","ended_utc","error","pair_key"]
     def __init__(self, run_id, seed_id, model):
         self.attempt_id = f"{run_id}-{uuid.uuid4().hex[:8]}"
         self.run_id, self.seed_id, self.model = run_id, seed_id, model
@@ -103,10 +121,11 @@ class Attempt:  # reservation row, written before the call
         self.input_chars = self.output_chars = 0
         self.usage = None
         self.started_utc, self.ended_utc, self.error = now(), None, None
+        self.pair_key = None             # pair-scoped claim key "seedid#k" (Instinct 0048 A)
     def row(self):
         return {k: getattr(self, k) for k in self.FIELDS}
 
-SPENT_STATUSES = ("completed","failed","timeout","unknown","pending","claimed","throttled")
+SPENT_STATUSES = ("completed","failed","timeout","unknown","pending","claimed","throttled","unparseable")
 HELD_STATUSES = ("pending","claimed")
 # A seed with one of these rows is never re-claimed: closed non-throttled attempts
 # may already be billable, and the lead rule (Instinct 0002 item 3) forbids
@@ -123,13 +142,23 @@ class Ledger:
     def __init__(self, path):
         self.path = path
         self._rows = None
+        self._offset = 0                 # file bytes already parsed into _rows
+        self._eff = None
     def _lockfile(self):
         return self.path + ".lock"
     def _append_unlocked(self, row):
+        blob = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
         with open(self.path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
             fh.flush(); os.fsync(fh.fileno())
-        self._rows = None
+        # The writer's own bytes are known: extend the cache instead of dropping
+        # the parse (DeepSeek 0038 R3). The tail offset comes from the file's
+        # real size under the same flock -- never from a recomputed length, so
+        # the tail read can never start mid-row (spawn-run diagnosis 2026-11-11).
+        if self._rows is not None:
+            self._rows.append(row)
+            self._offset = os.path.getsize(self.path)
+        self._eff = None
     def append(self, a):
         lock = open(self._lockfile(), "a")
         try:
@@ -139,24 +168,61 @@ class Ledger:
             fcntl.flock(lock, fcntl.LOCK_UN); lock.close()
     def rows(self):
         if self._rows is None:
-            try:
-                with open(self.path, encoding="utf-8") as fh:
-                    self._rows = [json.loads(l) for l in fh if l.strip()]
-            except FileNotFoundError:
-                self._rows = []
+            self._refresh_from(0)
         return self._rows
+    def refresh(self):
+        """Fresh read for the reserve-and-check claim: re-parse only the bytes
+        appended since the last read (the first read on a fresh Ledger parses
+        the whole file). Appends always happen under the ledger flock, so a
+        tail read under that same lock sees every other worker's row
+        (DeepSeek 0038 R3: total parsed rows O(N), not 3 x N^2)."""
+        self._refresh_from(0 if self._rows is None else self._offset)
+        return self._rows
+    def _refresh_from(self, offset):
+        if self._rows is None:
+            self._rows = []
+        try:
+            self._read_lines(offset)
+        except json.JSONDecodeError:
+            # A tail offset that no longer lands on a line boundary heals by one
+            # full re-parse: rare, bounded, and it can never silently skip a row.
+            # A corrupt line mid-file still raises (fail loud, never guess).
+            self._rows = []
+            self._read_lines(0)
+        self._eff = None
+        return self._rows
+
+    def _read_lines(self, offset):
+        pos = offset
+        try:
+            with open(self.path, "rb") as fh:
+                fh.seek(offset)
+                for line in fh:
+                    if not line.endswith(b"\n"):
+                        break            # a writer is mid-append: stop before the partial line
+                    pos += len(line)
+                    s = line.decode("utf-8").strip()
+                    if s:
+                        self._rows.append(json.loads(s))
+        except FileNotFoundError:
+            pass
+        self._offset = pos
     def effective_rows(self):
         """One row per attempt: the LAST row written for that attempt_id wins.
         Claims, reservations and closes share attempt_id by design, and a later
         close (for example completed then unparseable) supersedes the earlier one."""
-        best = {}
-        for r in self.rows():
-            best[r["attempt_id"]] = r
-        return list(best.values())
+        if self._eff is None:
+            best = {}
+            for r in self.rows():
+                best[r["attempt_id"]] = r
+            self._eff = list(best.values())
+        return self._eff
     def spent_chars(self):
         # unknown/pending/claimed/failed/timeout/throttled all count: a call may be
         # billable though its response never landed (ChatGPT 1703, Instinct 2020).
-        # released and refused_cap do not: nothing was sent.
+        # unparseable counts too: a parsed-but-unusable reply is a real charge with
+        # no pair, never a zero in the stage-1 reconcile number (DeepSeek 0038 R2,
+        # Instinct 0048 C). released and refused_cap do not: nothing was sent.
         return sum(r["input_chars"] + r["output_chars"] for r in self.effective_rows()
                    if r["status"] in SPENT_STATUSES)
     def attempts(self):
@@ -171,20 +237,23 @@ def record_chars(text):
     over-reserve, never under-reserve."""
     return len(text.encode("utf-8"))
 
-def claim_seed(cfg, seed_id, model_id, ledger):
+def claim_seed(cfg, claim_key, model_id, ledger):
     """Cross-process reserve-and-check (DeepSeek 2137, adopted Instinct 0002 item 1):
-    under the ledger flock, re-read the ledger and append a claimed row if the seed
-    is free; return the claim row, or None when another worker holds it."""
+    under the ledger flock, re-read the ledger and append a claimed row if the
+    PAIR is free; return the claim row, or None when another worker holds it.
+    The key is pair-scoped ("seedid#k", Instinct 0048 A): pair 1 completing must
+    not silently block pairs 2..N of the same seed."""
     lock = open(ledger._lockfile(), "a")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        ledger._rows = None          # fresh read under the lock: other workers'
-                                     # appends cannot invalidate our cache
+        ledger.refresh()             # fresh read under the lock: other workers'
+                                     # appends cannot slip past the tail offset
         for r in ledger.effective_rows():
-            if r.get("seed_id") == seed_id and r["status"] in BLOCKED_STATUSES:
+            if r.get("pair_key") == claim_key and r["status"] in BLOCKED_STATUSES:
                 return None                      # held or already attempted: never re-bill
-        c = Attempt(cfg["run_id"], seed_id, model_id)
+        c = Attempt(cfg["run_id"], claim_key.rsplit("#", 1)[0], model_id)
         c.status = "claimed"
+        c.pair_key = claim_key
         ledger._append_unlocked(c.row())
         return c
     finally:
@@ -247,8 +316,10 @@ def release_claim(ledger, a):
                 a["model"] if isinstance(a, dict) else a.model)
     if isinstance(a, dict):
         c.attempt_id = a["attempt_id"]
+        c.pair_key = a.get("pair_key")
     else:
         c.attempt_id = a.attempt_id
+        c.pair_key = a.pair_key
     c.status = "released"; c.ended_utc = now(); c.error = "released without a call"
     ledger.append(c)
 
@@ -258,6 +329,7 @@ def close_attempt(ledger, a, status, error):
     output term stays; the pair itself never counts as made."""
     c = Attempt(a["run_id"], a["seed_id"], a["model"])
     c.attempt_id = a["attempt_id"]
+    c.pair_key = a.get("pair_key")
     c.input_chars = a["input_chars"]; c.output_chars = a["output_chars"]
     c.usage = a["usage"]; c.status = status; c.error = error; c.ended_utc = now()
     ledger.append(c)
@@ -305,10 +377,18 @@ class OciAdapter:
       assumes one generation, and a config asking for more fails fast in main().
     - the client is built with oci.retry.NoneRetryStrategy() so the SDK performs no
       hidden retries: one runner attempt is one billed call.
-    - the reply is read from the real message field (choices[0].message.content for
-      GENERIC, chat_response.text for Cohere); a reply without that field is an
-      error, never a longest-string guess across the whole response.
-    - any usage object in the response is returned verbatim for reconciliation.
+    - the reply is read from the real path: chat() returns ChatResult, whose
+      chat_response is a GenericChatResponse for GENERIC chat with
+      choices[0].message.content a LIST of ChatContent (TextContent.text carries
+      the text), and chat_response.text for Cohere. message.content is unwrapped
+      in order, never str()-ed: stringifying a list books a billed attempt whose
+      reply can never parse (Instinct 0048 B). A reply without a readable text
+      field is an error, never a longest-string guess across the whole response.
+    - any usage object in the response is returned verbatim for reconciliation
+      (GenericChatResponse.usage, ChatChoice.usage, or the Cohere usage).
+    The response shape is SHAPE-CHECKED against oci 2.191.0's own model classes
+    (built and walked in the suite without a live call); the request side stays
+    DOC-CHECKED against the SDK docs, NOT yet run live.
     The oci import stays lazy so the stub path never needs the package."""
     def __init__(self, cfg):
         import oci
@@ -319,23 +399,88 @@ class OciAdapter:
         self.cfg = cfg
     class Throttled(Exception):
         pass
-    def _reply_and_usage(self, data):
-        d = data.to_dict() if hasattr(data, "to_dict") else data
-        # GENERIC chat: ChatResult.data.choices[i].message.content
-        choices = d.get("choices") if isinstance(d, dict) else None
-        if choices:
-            msg = choices[0].get("message") or {}
-            text = msg.get("content")
-            if text:
-                return str(text), (d.get("usage") if isinstance(d.get("usage"), (dict, type(None))) else None)
-        # Cohere: ChatResult.data.chat_response.text
-        cr = d.get("chat_response") if isinstance(d, dict) else None
-        if isinstance(cr, dict):
-            text = cr.get("text")
-            if text:
-                return str(text), (cr.get("usage") if isinstance(cr.get("usage"), (dict, type(None))) else None)
+    @staticmethod
+    def _as_dict(o):
+        """SDK model objects become plain dicts via to_dict(); objects without
+        one (ChatResult itself) are read attribute-wise, so the real response
+        and legacy dict fixtures walk the same code."""
+        if o is None or isinstance(o, (str, int, float, bool)):
+            return o
+        if isinstance(o, dict):
+            return o
+        try:
+            return o.to_dict()
+        except AttributeError:
+            # Some SDK model classes (oci 2.191.0: Usage, ChatResult) carry no
+            # to_dict; their instance __dict__ is the attribute map, with the
+            # real fields under underscore-prefixed names (ChatResult keeps
+            # _chat_response and exposes chat_response as a property).
+            d = getattr(o, "__dict__", None)
+            if isinstance(d, dict):
+                d = {k.lstrip("_"): v for k, v in d.items()}
+                d.pop("attribute_map", None); d.pop("swagger_types", None)
+                if d:
+                    return d
+            d = {n: getattr(o, n) for n in ("chat_response", "choices", "message",
+                                            "content", "text", "usage") if hasattr(o, n)}
+            return d if d else o
+    @staticmethod
+    def _content_text(content):
+        """message.content arrives as a plain string OR a list of ChatContent
+        (TextContent.text). A real GENERIC reply is the list shape; str(list)
+        would book a billed attempt whose reply can never parse, so a list is
+        unwrapped in order and non-TEXT parts are skipped (Instinct 0048 B)."""
+        if content is None:
+            return None
+        if isinstance(content, str):
+            return content if content.strip() else None
+        items = content if isinstance(content, (list, tuple)) else [content]
+        parts = []
+        for item in items:
+            if isinstance(item, str):
+                text = item
+            elif isinstance(item, dict):
+                text = item.get("text")
+            else:
+                text = getattr(item, "text", None)
+            if isinstance(text, str) and text:
+                parts.append(text)
+        if not parts:
+            return None
+        return "".join(parts)
+    def _reply_and_usage(self, result):
+        d = self._as_dict(result)
+        if not isinstance(d, dict):
+            raise RuntimeError("reply arrived without a message text field; refusing to "
+                               f"guess. type: {type(result).__name__}")
+        # GENERIC: ChatResult.chat_response.choices[i].message.content (the real
+        # SDK shape), with the legacy flat {"choices":[...]} dict also accepted;
+        # Cohere: chat_response.text.
+        cr = d.get("chat_response")
+        containers = [self._as_dict(cr) if cr is not None else None, d]
+        for container in containers:
+            if not isinstance(container, dict):
+                continue
+            choices = container.get("choices")
+            if choices:
+                ch = self._as_dict(choices[0])
+                msg = ch.get("message") if isinstance(ch, dict) else None
+                md = self._as_dict(msg) if msg is not None else None
+                text = self._content_text(md.get("content") if isinstance(md, dict) else None)
+                if text:
+                    usage = container.get("usage")
+                    if usage is None and isinstance(ch, dict):
+                        usage = ch.get("usage")
+                    ud = self._as_dict(usage) if usage is not None else None
+                    return text, (ud if isinstance(ud, dict) else None)
+        crd = self._as_dict(cr) if cr is not None else None
+        if isinstance(crd, dict):
+            text = crd.get("text")
+            if isinstance(text, str) and text.strip():
+                ud = self._as_dict(crd.get("usage")) if crd.get("usage") is not None else None
+                return text, (ud if isinstance(ud, dict) else None)
         raise RuntimeError("reply arrived without a message text field; refusing to "
-                           f"guess. keys: {sorted(d.keys()) if isinstance(d, dict) else type(d).__name__}")
+                           f"guess. keys: {sorted(d.keys()) if isinstance(d, dict) else type(result).__name__}")
     def generate(self, model_id, prompt, cfg):
         import oci
         if int(cfg.get("num_generations", 1)) != 1:
@@ -357,7 +502,7 @@ class OciAdapter:
         detail.compartment_id = cfg["compartment_id"]
         try:
             result = self.client.chat(detail)
-            return self._reply_and_usage(result.data)
+            return self._reply_and_usage(result)
         except oci.exceptions.ServiceError as e:
             if e.status == 429:
                 raise OciAdapter.Throttled(str(e))
@@ -366,14 +511,19 @@ class OciAdapter:
 def build_client(cfg):  # real path (stage 1+): region from config, adapter provides .generate
     return OciAdapter(cfg)
 
-def pick_model(cfg, seed_id, ledger_rows):
+def pick_model(cfg, seed_id, ledger_rows, pair_key=None):
+    """Deterministic resume: a seed's spent rows fix the model for every pair.
+    A pending/claimed row blocks only ITS pair when the row carries a pair_key
+    (Instinct 0048 A); pair_key=None keeps the conservative whole-seed read for
+    direct callers and pre-pair-key rows."""
     allowed = {m["model_id"] for m in cfg["models"]}
     if not allowed:
         raise ValueError("empty allow-list")
     for r in ledger_rows:               # deterministic resume: same seed, same model
         if r["seed_id"] == seed_id:
             if r["status"] in ("pending", "claimed"):
-                return None             # another worker holds this pair in flight
+                if pair_key is None or r.get("pair_key") in (None, pair_key):
+                    return None         # another worker holds this pair in flight
             if r["status"] in SPENT_STATUSES + ("unparseable",):
                 return r["model"]
     ids = sorted(allowed)
@@ -445,7 +595,7 @@ def main():
         sys.exit("config needs attempt_char_cap: the per-attempt reservation ceiling in "
                  "chars, at least input bytes + overhead + the reply term (113 x max_tokens "
                  "= 115,712 bytes at 1,024 tokens)")
-    overhead = int(cfg.get("prompt_overhead_chars", 200))
+    overhead = int(cfg.get("prompt_overhead_chars", 200))  # ASSUMPTION, stated: 200 bytes of per-call overhead until stage-1 reconciliation settles the real number (Instinct 0008 item 3)
     max_retries = args.max_retries if args.max_retries is not None else int(cfg.get("max_retries", 2))
     os.makedirs(os.path.dirname(cfg["out_path"]) or ".", exist_ok=True)
     seeds_done = load_seed_ids(cfg["out_path"])
@@ -471,10 +621,11 @@ def main():
         for k in range(seed.get("n_pairs", cfg.get("pairs_per_seed", 4))):
             if made >= n_max or budget_hit or attempts_cap_hit:
                 break
-            model_id = pick_model(cfg, seed["id"], ledger.effective_rows())
+            pk = f"{seed['id']}#{k + 1}"     # pair-scoped claim key (Instinct 0048 A)
+            model_id = pick_model(cfg, seed["id"], ledger.effective_rows(), pk)
             if model_id is None:
-                held_seen.append(f"{seed['id']} (held by another worker)")
-                continue                    # another worker holds this seed in flight
+                held_seen.append(f"{pk} (held by another worker)")
+                continue                    # another worker holds this pair in flight
             rec_id = f"{seed['id']}#{k+1}#{model_id.rsplit('.',1)[-1][:24]}"
             if rec_id in seeds_done: continue
             if args.max_attempts and ledger.attempts() >= args.max_attempts:
@@ -484,9 +635,9 @@ def main():
             # Bounded 429 retry: each retry is a NEW reserved attempt, never a
             # silent repeat of the same one (Instinct 0007 item 3).
             for try_n in range(max_retries + 1):
-                claim = claim_seed(cfg, seed["id"], model_id, ledger)
+                claim = claim_seed(cfg, pk, model_id, ledger)
                 if claim is None:
-                    held_seen.append(f"{seed['id']} (held by another worker)")
+                    held_seen.append(f"{pk} (held or already attempted)")
                     break
                 try:
                     a, reply = run_once(cfg, lambda: build_client(cfg), seed, model_id,
@@ -545,14 +696,18 @@ def main():
                 break
     # Held seeds are LISTED, never auto-released (Instinct 0002 item 3): a person
     # reconciles each against Oracle's usage view before the seed unblocks.
-    held = sorted({r["seed_id"] for r in ledger.effective_rows() if r["status"] in HELD_STATUSES})
-    closed_unretried = sorted({r["seed_id"] for r in ledger.effective_rows()
+    held = sorted({(r.get("pair_key") or r["seed_id"]) for r in ledger.effective_rows()
+                   if r["status"] in HELD_STATUSES})
+    closed_unretried = sorted({(r.get("pair_key") or r["seed_id"]) for r in ledger.effective_rows()
                                if r["status"] in ("unknown","timeout","unparseable")})
     if skipped_status:
         print(f"skipped rows by execution_status: "
               f"{', '.join(f'{k}={v}' for k, v in sorted(skipped_status.items()))}")
     if cap_refusals:
         print(f"cap refusals (nothing sent): {cap_refusals}")
+    if held_seen:
+        print(f"pairs skipped this run (held or already attempted): "
+              f"{', '.join(sorted(set(held_seen)))}")
     if held:
         print(f"held seeds awaiting manual reconciliation against Oracle's usage view: "
               f"{', '.join(held)}")
