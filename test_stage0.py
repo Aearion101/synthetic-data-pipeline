@@ -57,7 +57,7 @@ class SpyClient:
         if v == "boom":   raise RuntimeError("stub boom")
         if v == "timeout": raise TimeoutError("stub timeout")
         if v == "throttle": raise R.OciAdapter.Throttled("stub 429")
-        return v, {"output_tokens": 42}
+        return v, {"output_tokens": 42}, "stop"
 
 def run_main(cfg, script, monkey_factory=None):
     """Drive main() on its own path with a spy factory."""
@@ -292,9 +292,10 @@ def suite():
     ad.cfg = {}
     fake = type("FakeData", (), {})()
     fake.to_dict = lambda: {"choices": [{"message": {"content": "the real reply"}}], "usage": {"output_tokens": 9}}
-    got, usage = ad._reply_and_usage(fake)
+    got, usage, fr = ad._reply_and_usage(fake)
     check("T13 adapter reads choices[0].message.content and passes usage verbatim",
-          got == "the real reply" and usage == {"output_tokens": 9}, f"got={got!r} usage={usage!r}")
+          got == "the real reply" and usage == {"output_tokens": 9},
+          f"got={got!r} usage={usage!r} fr={fr!r}")
     fake2 = type("FakeData", (), {})()
     fake2.to_dict = lambda: {"something": "else"}
     refused = False
@@ -423,16 +424,16 @@ def suite():
     def fake_data(d):
         return type("FakeData", (), {"to_dict": lambda self: d})()
     ad = object.__new__(R.OciAdapter); ad.cfg = {}
-    got, usage = ad._reply_and_usage(fake_data({
+    got, usage, fr = ad._reply_and_usage(fake_data({
         "chat_response": {"api_format": "GENERIC",
             "choices": [{"index": 0, "message": {"role": "ASSISTANT",
                 "content": [{"type": "TEXT", "text": "the real reply"}]},
                 "finish_reason": "stop"}],
             "usage": {"completion_tokens": 7}}}))
     check("T22 GENERIC reply from chat_response.choices[0].message.content (dict shape)",
-          got == "the real reply" and usage == {"completion_tokens": 7},
-          f"got={got!r} usage={usage!r}")
-    got3, _ = ad._reply_and_usage(fake_data({
+          got == "the real reply" and usage == {"completion_tokens": 7} and fr == "stop",
+          f"got={got!r} usage={usage!r} fr={fr!r}")
+    got3, _, fr3 = ad._reply_and_usage(fake_data({
         "choices": [{"message": {"content": [{"type": "TEXT", "text": "part one "},
                                              {"type": "IMAGE", "url": "x"},
                                              {"type": "TEXT", "text": "part two"}]}}]}))
@@ -444,6 +445,11 @@ def suite():
     except RuntimeError as e:
         refused2 = "refusing to guess" in str(e)
     check("T22 an empty content list still refuses to guess", refused2)
+    got4, usage4, fr4 = ad._reply_and_usage(fake_data(
+        {"chat_response": {"text": "cohere reply", "finish_reason": "length",
+                            "usage": {"output_tokens": 3}}}))
+    check("T22 Cohere chat_response.text with finish_reason verbatim",
+          got4 == "cohere reply" and fr4 == "length", f"got={got4!r} fr={fr4!r}")
     sdk_ok = None
     try:
         import oci
@@ -455,8 +461,8 @@ def suite():
         res.chat_response = m.GenericChatResponse(
             api_format=m.GenericChatResponse.API_FORMAT_GENERIC, choices=[ch],
             usage=m.Usage(completion_tokens=7))
-        got2, usage2 = ad._reply_and_usage(res)
-        sdk_ok = (got2 == "sdk-shaped reply"
+        got2, usage2, fr2 = ad._reply_and_usage(res)
+        sdk_ok = (got2 == "sdk-shaped reply" and fr2 == "stop"
                   and isinstance(usage2, dict) and usage2.get("completion_tokens") == 7)
     except ImportError:
         pass
@@ -527,6 +533,78 @@ def suite():
     except json.JSONDecodeError:
         raised = True
     check("T25 a corrupt complete line still raises (fail loud, never guess)", raised)
+
+    # T26 (Fo 0245 addendum item 1): the shipped one-stage config cannot refuse its
+    # own rows. The longest one-stage render is 922 bytes (ChatGPT 0308); at
+    # max_tokens 1024 the reply term is 113 x 1024 = 115,712; with the 200-char
+    # overhead the worst attempt is 922 + 200 + 115,712 = 116,834 <= 120,000, so
+    # the shipped config produces NO zero-call green exit from cap refusals.
+    cfg = fresh({"attempt_char_cap": 120000, "max_tokens": 1024})
+    cfg["run_id"] = "t26"
+    seed = {"id": "seed-t26", "topic": "rain"}
+    prompt = "x" * 922
+    a, reply = R.run_once(cfg, lambda: SpyClient(["ok"]), seed, "alpha.model", prompt,
+                          R.Ledger(cfg["ledger_path"]), max_out_chars=113 * cfg["max_tokens"],
+                          overhead_chars=200)
+    check("T26 longest one-stage row (922 bytes) is NOT refused_cap at 1024/120000",
+          a.status == "completed", f"status={a.status} error={getattr(a, 'error', None)}")
+    refused_total = a.input_chars + 113 * cfg["max_tokens"]
+    check("T26 shipped-config arithmetic stays under the cap",
+          refused_total <= cfg["attempt_char_cap"], f"sum={refused_total}")
+
+    # T27 (Claude 0234): a truncated reply (finish_reason "length") closes
+    # unparseable and the close note carries "finish_reason: length", so the
+    # ledger can tell a max_tokens cut from a format refusal.
+    cfg = fresh(); cfg["run_id"] = "t27"
+    ledger = R.Ledger(cfg["ledger_path"])
+    seed = {"id": "seed-t27", "topic": "rain"}
+    a, reply = R.run_once(cfg, lambda: R.StubClient(["truncated"]), seed, "alpha.model", "p",
+                          ledger, max_out_chars=113 * cfg["max_tokens"], overhead_chars=200)
+    check("T27 truncated reply books a completed attempt with finish_reason length",
+          a.status == "completed" and a.finish_reason == "length",
+          f"status={a.status} fr={a.finish_reason}")
+    try:
+        R.parse_pair(reply)
+        parsed = False
+    except (ValueError, json.JSONDecodeError):
+        parsed = True
+    check("T27 a truncated JSON reply does not parse", parsed)
+    R.close_attempt(ledger, a.row(), "unparseable", "parse: Unterminated string")
+    close_row = [r for r in ledger.effective_rows() if r["status"] == "unparseable"][-1]
+    check("T27 unparseable close note carries finish_reason length",
+          close_row["finish_reason"] == "length" and "finish_reason: length" in close_row["error"],
+          f"fr={close_row['finish_reason']} err={close_row['error']!r}")
+
+    # T28 (Claude 0234 offer 3): the run-end listing counts unparseable rows by
+    # finish_reason, so the first live probe answers the max_tokens question.
+    cfg = fresh(); cfg["run_id"] = "t28"
+    ledger = R.Ledger(cfg["ledger_path"])
+    for sid, action in (("seed-a", "truncated"), ("seed-b", "badjson")):
+        a, reply = R.run_once(cfg, lambda: R.StubClient([action]), {"id": sid, "topic": "rain"},
+                              "alpha.model", "p", ledger,
+                              max_out_chars=113 * cfg["max_tokens"], overhead_chars=200)
+        try:
+            R.parse_pair(reply)
+            e = "no error"
+        except (ValueError, json.JSONDecodeError) as ex:
+            e = f"parse: {ex}"
+        R.close_attempt(ledger, a.row(), "unparseable", e)
+    counts = R.unparseable_by_finish_reason(ledger)
+    check("T28 unparseable rows counted by finish_reason (length vs stop)",
+          counts.get("length") == 1 and counts.get("stop") == 1, f"counts={counts}")
+
+    # T29 (Fo 0245 addendum item 1): the shipped example config itself states the
+    # one-stage shape: one pair per row, the one-stage template label, and the
+    # numbers DeepSeek 0236 measured (1024 fits the 120,000 cap on 922 bytes).
+    ecfg = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "gen_config.example.json")))
+    check("T29 shipped config: pairs_per_seed 1 and the one-stage template label",
+          ecfg.get("pairs_per_seed") == 1 and ecfg.get("template") == "one-stage-1.0.0",
+          f"pairs={ecfg.get('pairs_per_seed')} template={ecfg.get('template')}")
+    check("T29 shipped config: max_tokens 1024 fits attempt_char_cap 120000",
+          ecfg.get("max_tokens") == 1024 and ecfg.get("attempt_char_cap") == 120000
+          and 922 + 200 + 113 * 1024 <= ecfg["attempt_char_cap"],
+          f"max_tokens={ecfg.get('max_tokens')} cap={ecfg.get('attempt_char_cap')}")
 
 def worker(cfg, n, q):
     """Same five seeds from two workers. Config arrives as an argument so the

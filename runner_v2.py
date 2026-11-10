@@ -98,6 +98,11 @@ Fixes from Instinct 0048 + DeepSeek 0038 (the 42cad8e review round, 2026-11-11):
  36 the ledger re-parses only appended bytes (Ledger.refresh()); the claim's
     fresh read is a tail parse, so 16,000 attempts no longer cost ~28 minutes
     of JSON parsing (DeepSeek 0038 R3; measured, not claimed).
+ 37 finish_reason is carried verbatim from both adapter paths (generic
+    choices[0].finish_reason, Cohere chat_response.finish_reason) onto the
+    attempt row, into the unparseable close note, and counted at run end
+    (Claude 0234): a truncated reply (finish_reason "length") is distinguishable
+    from a format refusal in the ledger itself.
  Still open: pending-row recovery for a killed worker (lead's call; listed at run
  end per 30 until then). Region, max_tokens enforcement and usage-view lag are
  stage-1 observations, not settled facts.
@@ -113,13 +118,14 @@ def stable_slot(seed_id, n):
 
 class Attempt:  # reservation row, written before the call
     FIELDS = ["attempt_id","run_id","seed_id","model","status","input_chars",
-              "output_chars","usage","started_utc","ended_utc","error","pair_key"]
+              "output_chars","usage","finish_reason","started_utc","ended_utc","error","pair_key"]
     def __init__(self, run_id, seed_id, model):
         self.attempt_id = f"{run_id}-{uuid.uuid4().hex[:8]}"
         self.run_id, self.seed_id, self.model = run_id, seed_id, model
         self.status = "pending"          # claimed -> pending -> completed|failed|timeout|unknown|throttled|released|unparseable
         self.input_chars = self.output_chars = 0
         self.usage = None
+        self.finish_reason = None       # verbatim from the adapter path (Claude 0234)
         self.started_utc, self.ended_utc, self.error = now(), None, None
         self.pair_key = None             # pair-scoped claim key "seedid#k" (Instinct 0048 A)
     def row(self):
@@ -292,9 +298,10 @@ def run_once(cfg, client_factory, seed, model_id, prompt, ledger, max_out_chars=
     ledger.append(a)                       # reservation BEFORE the call
     reply = None
     try:
-        reply, usage = client.generate(model_id, prompt, cfg)
+        reply, usage, finish_reason = client.generate(model_id, prompt, cfg)
         a.output_chars = record_chars(reply)
         a.usage = usage
+        a.finish_reason = finish_reason     # Claude 0234: verbatim onto the row
         a.status = "completed"; a.ended_utc = now()
     except OciAdapter.Throttled:
         a.status = "throttled"; a.ended_utc = now(); a.error = "429 throttled"
@@ -323,6 +330,17 @@ def release_claim(ledger, a):
     c.status = "released"; c.ended_utc = now(); c.error = "released without a call"
     ledger.append(c)
 
+def unparseable_by_finish_reason(ledger):
+    """Run-end count of unparseable rows by the reply's finish_reason (Claude 0234):
+    "length" names a max_tokens cut, "stop" with prose a format refusal, "unset"
+    a close that predates the field."""
+    counts = {}
+    for r in ledger.effective_rows():
+        if r["status"] == "unparseable":
+            k = r.get("finish_reason") or "unset"
+            counts[k] = counts.get(k, 0) + 1
+    return counts
+
 def close_attempt(ledger, a, status, error):
     """F6 close: supersede a completed attempt with an unparseable one (same
     attempt_id, last row wins). The reply's byte count is known, so the settled
@@ -331,6 +349,10 @@ def close_attempt(ledger, a, status, error):
     c.attempt_id = a["attempt_id"]
     c.pair_key = a.get("pair_key")
     c.input_chars = a["input_chars"]; c.output_chars = a["output_chars"]
+    fr = a["finish_reason"] if isinstance(a, dict) else a.finish_reason
+    if status == "unparseable" and fr:
+        error = f"{error}; finish_reason: {fr}"   # Claude 0234: "length" names a max_tokens cut
+    c.finish_reason = fr
     c.usage = a["usage"]; c.status = status; c.error = error; c.ended_utc = now()
     ledger.append(c)
 
@@ -344,7 +366,7 @@ class StubClient:
         action = self.script.pop(0)
         if action == "ok":
             reply = '{"instruction": "Write a short haiku about rain.", "response": "Soft rain on the roof,\\n.each drop a small metronome,\\nthe night keeps its time."}'
-            return reply, {"output_tokens": 42}
+            return reply, {"output_tokens": 42}, "stop"
         if action == "timeout":
             raise TimeoutError("stub timeout")
         if action == "boom":          # unknown: billable-or-not undecidable
@@ -352,7 +374,9 @@ class StubClient:
         if action == "throttle":
             raise OciAdapter.Throttled("stub 429")
         if action == "badjson":
-            return "here is prose, no json at all", None
+            return "here is prose, no json at all", None, "stop"
+        if action == "truncated":     # max_tokens cut the JSON mid-string (Claude 0234)
+            return '{"instruction": "Write a short haiku about r', None, "length"
         raise ValueError("bad stub action")
 
 def parse_pair(text):
@@ -472,13 +496,14 @@ class OciAdapter:
                     if usage is None and isinstance(ch, dict):
                         usage = ch.get("usage")
                     ud = self._as_dict(usage) if usage is not None else None
-                    return text, (ud if isinstance(ud, dict) else None)
+                    fr = ch.get("finish_reason") if isinstance(ch, dict) else None
+                    return text, (ud if isinstance(ud, dict) else None), fr
         crd = self._as_dict(cr) if cr is not None else None
         if isinstance(crd, dict):
             text = crd.get("text")
             if isinstance(text, str) and text.strip():
                 ud = self._as_dict(crd.get("usage")) if crd.get("usage") is not None else None
-                return text, (ud if isinstance(ud, dict) else None)
+                return text, (ud if isinstance(ud, dict) else None), crd.get("finish_reason")
         raise RuntimeError("reply arrived without a message text field; refusing to "
                            f"guess. keys: {sorted(d.keys()) if isinstance(d, dict) else type(result).__name__}")
     def generate(self, model_id, prompt, cfg):
@@ -714,6 +739,10 @@ def main():
     if closed_unretried:
         print(f"closed attempts NOT auto-retried (unknown/timeout/unparseable; lead rule, "
               f"no silent re-bill): {', '.join(closed_unretried)}")
+    unp_fr = unparseable_by_finish_reason(ledger)
+    if unp_fr:
+        print("unparseable by finish_reason (Claude 0234): "
+              + ", ".join(f"{k}={v}" for k, v in sorted(unp_fr.items())))
     note = "" if ledger.attempts() else (" (no attempts booked: seeds empty, budget "
                                          "exhausted, or cap already reached)")
     print(f"done: run {cfg['run_id']} made {made} pairs; ledger {ledger.attempts()} attempts, "

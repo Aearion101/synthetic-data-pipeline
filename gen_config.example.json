@@ -11,16 +11,17 @@
       "weight": 1
     }
   ],
-  "template": "pair-from-topic-v1",
+  "template": "one-stage-1.0.0",
   "temperature": 0.8,
   "max_tokens": 1024,
   "attempt_char_cap": 120000,
-  "pairs_per_seed": 4,
+  "pairs_per_seed": 1,
   "requests_per_minute": 12,
   "budget_usd": 300.0,
   "price_per_million_chars": 0.18,
   "max_retries": 4,
   "region": "us-ashburn-1",
   "compartment_id": "SET_ME",
-  "profile": "DEFAULT"
+  "profile": "DEFAULT",
+  "require_rendered_prompt": true
 }
