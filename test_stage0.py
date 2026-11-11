@@ -326,12 +326,20 @@ def suite():
     ph.join(10)
     check("T14 child reported holding the lock", q2.get() == "held")
 
-    # T15: cap refusal returns the sentinel, books nothing, kills nothing
+    # T15: cap refusal returns the sentinel, books nothing, and the run refuses
+    # to look successful (exit 3 with a named signal, never a silent rc 0)
+    import io as _io15, contextlib as _cl15
     cfg = fresh(); write_seeds(cfg, 2); cfg["attempt_char_cap"] = 300
-    run_main(cfg, ["ok"])
-    check("T15 cap refusal: no attempt booked, run survives",
-          R.Ledger(cfg["ledger_path"]).attempts() == 0 and len(out_recs(cfg["out_path"])) == 0,
-          f"attempts={R.Ledger(cfg['ledger_path']).attempts()}")
+    rc15 = None
+    with _cl15.redirect_stderr(_io15.StringIO()):
+        try:
+            run_main(cfg, ["ok"])
+        except SystemExit as e:
+            rc15 = e.code
+    check("T15 cap refusal: no attempt booked, run exits 3 (not silent success)",
+          R.Ledger(cfg["ledger_path"]).attempts() == 0
+          and len(out_recs(cfg["out_path"])) == 0 and rc15 == 3,
+          f"attempts={R.Ledger(cfg['ledger_path']).attempts()} rc={rc15}")
 
     # T16: held seeds are LISTED at run end, never auto-released
     import io, contextlib
@@ -802,6 +810,75 @@ def suite():
               proc.returncode == 2 and "runner_v2.py" in proc.stderr
               and proc.stdout == "" and "Traceback" not in proc.stderr,
               f"rc={proc.returncode} out={proc.stdout[:120]!r} err={proc.stderr[:160]!r}")
+
+    # T37: an unset owner value fails with a NAMED config error before the run
+    # lock, auth, or network (was: bare KeyError 'budget_usd')
+    import io as _io37, contextlib as _cl37
+    cfg = fresh(); write_seeds(cfg, 1); cfg.pop("budget_usd")
+    d = os.path.dirname(cfg["seeds_path"]); p = os.path.join(d, "cfg37.json")
+    json.dump(cfg, open(p, "w")); sys.argv = ["runner_v2.py", "--config", p]
+    try:
+        R.main(); fast = False
+    except SystemExit as e:
+        fast = "budget_usd" in str(e)
+    check("T37 missing budget_usd fails fast naming the field, before the run lock",
+          fast is True and not os.path.exists(cfg["ledger_path"] + ".runlock"),
+          f"fast={fast} runlock_exists={os.path.exists(cfg['ledger_path'] + '.runlock')}")
+
+    # T38: a placeholder compartment fails with a named error before auth
+    cfg = fresh(); write_seeds(cfg, 1); cfg["compartment_id"] = "SET_ME"
+    d = os.path.dirname(cfg["seeds_path"]); p = os.path.join(d, "cfg38.json")
+    json.dump(cfg, open(p, "w")); sys.argv = ["runner_v2.py", "--config", p]
+    try:
+        R.main(); fast = False
+    except SystemExit as e:
+        fast = "compartment_id" in str(e)
+    check("T38 placeholder compartment_id fails fast naming the field",
+          fast is True and not os.path.exists(cfg["ledger_path"] + ".runlock"),
+          f"fast={fast}")
+
+    # T39: zero pairs from cap refusals is NOT a successful run (exit 3, named)
+    cfg = fresh(); write_seeds(cfg, 2); cfg["attempt_char_cap"] = 300
+    rc39, err39 = None, _io37.StringIO()
+    with _cl37.redirect_stderr(err39):
+        try:
+            run_main(cfg, ["ok"])
+        except SystemExit as e:
+            rc39 = e.code
+    check("T39 zero pairs from cap refusals exits 3 with a named signal",
+          rc39 == 3 and "NOT a successful run" in err39.getvalue(),
+          f"rc={rc39} err={err39.getvalue()[-160:]!r}")
+
+    # T40: full pack rows marked eligible run through main(): the language
+    # holds fire on the support/off-list flags and only the clean row is made
+    cfg = fresh()
+    seeds40 = [
+        {"id": "r-heldlang", "topic": "t", "prompt": "x" * 60,
+         "execution_status": "eligible", "support": {"llama4_documented": False}},
+        {"id": "r-offlist", "topic": "t", "prompt": "x" * 60,
+         "execution_status": "eligible", "off_list_source_language": True},
+        {"id": "r-clean", "topic": "t", "prompt": "x" * 60,
+         "execution_status": "eligible"},
+    ]
+    with open(cfg["seeds_path"], "w") as f:
+        for s in seeds40: f.write(json.dumps(s) + "\n")
+    d = os.path.dirname(cfg["seeds_path"]); p = os.path.join(d, "cfg40.json")
+    json.dump(cfg, open(p, "w"))
+    saved40 = R.build_client
+    R.build_client = lambda c: SpyClient([PAIR])
+    sys.argv = ["runner_v2.py", "--config", p]
+    buf40 = _io37.StringIO()
+    try:
+        with _cl37.redirect_stdout(buf40):
+            R.main()
+    finally:
+        R.build_client = saved40
+    out40 = out_recs(cfg["out_path"])
+    check("T40 eligible full rows: holds fire on flags, clean row runs",
+          len(out40) == 1 and out40[0]["id"].startswith("r-clean")
+          and "llama4-undocumented-language=1" in buf40.getvalue()
+          and "off-list-source-language=1" in buf40.getvalue(),
+          f"out={len(out40)} stdout_tail={buf40.getvalue()[-200:]!r}")
 
 def worker(cfg, n, q):
     """Same five seeds from two workers. Config arrives as an argument so the

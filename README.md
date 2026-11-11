@@ -50,6 +50,19 @@ dedicated-only for them (Oracle's Models-by-Region table).
 4. `python3 runner_v2.py --config gen_config.calibration.example.json --dry-run`
 5. Then the run:
    `python3 runner_v2.py --config gen_config.calibration.example.json --max-attempts N --limit N`
+   Owner-set values are validated before auth or any network call: an unset
+   compartment_id (placeholder SET_ME), budget_usd, attempt_char_cap, or a
+   missing seeds file stops the run with a named config error, never a bare
+   KeyError.
+   Cap sizing: each attempt reserves prompt bytes + prompt_overhead_chars
+   (default 200) + 113 x max_tokens (115,712 at 1,024 tokens). The
+   attempt_char_cap must clear that floor plus the prompt, or every attempt
+   is refused before anything is sent. The shipped 120,000 leaves about 3.3
+   KB of prompt headroom at max_tokens 1024. A run that makes zero pairs
+   because of cap refusals exits 3 and says "NOT a successful run"; rc 0
+   cannot masquerade as calibration evidence. A zero-pair run whose rows
+   were all skipped (pending approval or held) exits 0 and is the
+   legitimate unactivated state, not a failure.
 6. The ledger is `ledger_calib.jsonl`, an append-only JSONL of reservations,
    attempts, and spend in characters with a running USD estimate; pairs land
    at `out_path`. The runner records Oracle's usage fields verbatim, so

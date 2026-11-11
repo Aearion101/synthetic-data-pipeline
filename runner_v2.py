@@ -640,6 +640,60 @@ def acquire_run_lock(ledger_path):
         fd.close()
         return None
 
+
+class ConfigError(Exception):
+    pass
+
+def validate_config(cfg, dry_run=False):
+    """Clear, named config failure BEFORE the run lock, auth, or any network call
+    (a bare KeyError on an unset owner value is a readiness defect, not a guard).
+    Dry runs need only the file paths: the shipped example config must dry-run
+    clean while its owner-set values stay placeholders."""
+    errs = []
+    for key, why in (("seeds_path", "path to the seeds JSONL"),
+                     ("out_path", "path for generated pairs"),
+                     ("ledger_path", "path for the append-only ledger")):
+        if not cfg.get(key):
+            errs.append(f"config error: missing {key}: {why}")
+    if errs:
+        raise ConfigError("\n".join(errs))
+    if dry_run:
+        return
+    if not cfg.get("models") or not all(isinstance(m, dict) and m.get("model_id")
+                                        for m in cfg["models"]):
+        errs.append("config error: models must be a non-empty allow-list of "
+                    "{\"model_id\": ...} entries")
+    if not cfg.get("region"):
+        errs.append("config error: missing region: the on-demand region for the "
+                    "model (Llama 4 on-demand is us-chicago-1, not us-ashburn-1)")
+    comp = cfg.get("compartment_id")
+    if not comp or comp == "SET_ME":
+        errs.append("config error: compartment_id is unset (placeholder SET_ME): "
+                    "the owner sets the tenancy compartment; refusing before auth")
+    budget = cfg.get("budget_usd")
+    if not isinstance(budget, (int, float)) or isinstance(budget, bool) or budget <= 0:
+        errs.append("config error: budget_usd is unset or not a positive number: "
+                    "the dollar cap the ledger enforces; the owner sets it as the "
+                    "approval step; refusing before any call")
+    price = cfg.get("price_per_million_chars", 0.18)
+    if not isinstance(price, (int, float)) or isinstance(price, bool) or price <= 0:
+        errs.append("config error: price_per_million_chars must be a positive number")
+    mt = cfg.get("max_tokens")
+    if not isinstance(mt, int) or isinstance(mt, bool) or mt <= 0:
+        errs.append("config error: max_tokens missing or invalid: without it no reply "
+                    "term can be reserved, and the attempt would silently carry only "
+                    "its prompt charge (Claude 2235 N6)")
+    if not cfg.get("attempt_char_cap"):
+        errs.append("config error: attempt_char_cap missing: the per-attempt "
+                    "reservation ceiling in chars, at least input bytes + overhead + "
+                    "the reply term (113 x max_tokens = 115,712 bytes at 1,024 tokens); "
+                    "the owner sets it")
+    sp = cfg.get("seeds_path")
+    if sp and not os.path.exists(sp):
+        errs.append(f"config error: seeds_path {sp} does not exist")
+    if errs:
+        raise ConfigError("\n".join(errs))
+
 def load_seed_ids(out_path):
     done = set()
     try:
@@ -668,6 +722,10 @@ def main():
     if int(cfg.get("num_generations", 1)) != 1:
         sys.exit("config sets num_generations != 1: the reservation covers one "
                  "generation; every extra generation multiplies the bill")
+    try:
+        validate_config(cfg, dry_run=args.dry_run)
+    except ConfigError as e:
+        sys.exit(str(e))
     run_lock_fd = acquire_run_lock(cfg["ledger_path"])
     if run_lock_fd is None:
         sys.stderr.write("another runner process holds the run lock on this ledger; "
@@ -685,15 +743,9 @@ def main():
     budget_chars = cfg["budget_usd"] / price * 1e6
     # Bound the reply term before the call: the longest Llama-4 token decodes to
     # 113 characters (DeepSeek 2137), so a reply of max_tokens tokens is at most
-    # 113 x max_tokens characters.
-    if not cfg.get("max_tokens"):
-        sys.exit("config needs max_tokens: without it no reply term can be reserved, and the "
-                 "attempt would silently carry only its prompt charge (Claude 2235 N6)")
+    # 113 x max_tokens characters. max_tokens and attempt_char_cap are validated
+    # in validate_config() before the run lock.
     max_out_chars = cfg.get("max_chars_per_token", 113) * cfg["max_tokens"]
-    if not cfg.get("attempt_char_cap"):
-        sys.exit("config needs attempt_char_cap: the per-attempt reservation ceiling in "
-                 "chars, at least input bytes + overhead + the reply term (113 x max_tokens "
-                 "= 115,712 bytes at 1,024 tokens)")
     overhead = int(cfg.get("prompt_overhead_chars", 200))  # ASSUMPTION, stated: 200 bytes of per-call overhead until stage-1 reconciliation settles the real number (Instinct 0008 item 3)
     max_retries = args.max_retries if args.max_retries is not None else int(cfg.get("max_retries", 2))
     os.makedirs(os.path.dirname(cfg["out_path"]) or ".", exist_ok=True)
@@ -825,9 +877,19 @@ def main():
         print("unparseable by finish_reason (Claude 0234): "
               + ", ".join(f"{k}={v}" for k, v in sorted(unp_fr.items())))
     note = "" if ledger.attempts() else (" (no attempts booked: seeds empty, budget "
-                                         "exhausted, or cap already reached)")
+                                         "exhausted, cap refusals, or cap already reached)")
     print(f"done: run {cfg['run_id']} made {made} pairs; ledger {ledger.attempts()} attempts, "
           f"{ledger.spent_chars()} chars, est ${ledger.spent_chars()/1e6*price:.2f}{note}")
+    if made == 0 and cap_refusals:
+        # Zero pairs because every attempt was refused is NOT a successful run:
+        # exit non-zero so rc 0 can never masquerade as calibration evidence.
+        # (A zero-pair run whose rows were all skipped pending/held exits 0:
+        # that is the legitimate unactivated state, not a failure.)
+        sys.stderr.write(f"NOT a successful run: 0 pairs made, {cap_refusals} cap "
+                         "refusals (nothing was sent). attempt_char_cap must clear "
+                         "prompt bytes + overhead + 113 x max_tokens; raise it or "
+                         "lower max_tokens.\n")
+        sys.exit(3)
 
 def cfg_seeds(cfg):
     return [json.loads(l) for l in open(cfg["seeds_path"]) if l.strip() and not l.startswith("#")]
