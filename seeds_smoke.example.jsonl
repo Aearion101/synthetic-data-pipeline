@@ -1,0 +1,1 @@
+{"id": "smoke-1", "language": "en", "split": "smoke", "execution_status": "eligible", "prompt": "Reply with ONLY a JSON object of the form {\"instruction\": \"...\", \"response\": \"...\"} where instruction asks for a two-line haiku about rain and response is that haiku. No other text."}

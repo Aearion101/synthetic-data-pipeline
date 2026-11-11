@@ -109,6 +109,7 @@ Fixes from Instinct 0048 + DeepSeek 0038 (the 42cad8e review round, 2026-11-11):
 """
 import argparse, fcntl, hashlib, json, math, os, sys, time, uuid
 from datetime import datetime, timezone
+from runner_common import Throttled as _SharedThrottled, content_text as _shared_content_text
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -495,8 +496,11 @@ class OciAdapter:
             service_endpoint=f"https://inference.generativeai.{cfg['region']}.oci.oraclecloud.com",
             retry_strategy=oci.retry.NoneRetryStrategy())
         self.cfg = cfg
-    class Throttled(Exception):
-        pass
+    # One throttle type across script and import modes: when this file runs as
+    # __main__ and bearer_adapter imports it again as "runner_v2", a nested
+    # class would exist twice and a 429 would slip past the other's except.
+    # The single class lives in runner_common (review defect 1, 2026-11-11).
+    Throttled = _SharedThrottled
     @staticmethod
     def _as_dict(o):
         """SDK model objects become plain dicts via to_dict(); objects without
@@ -522,30 +526,7 @@ class OciAdapter:
             d = {n: getattr(o, n) for n in ("chat_response", "choices", "message",
                                             "content", "text", "usage") if hasattr(o, n)}
             return d if d else o
-    @staticmethod
-    def _content_text(content):
-        """message.content arrives as a plain string OR a list of ChatContent
-        (TextContent.text). A real GENERIC reply is the list shape; str(list)
-        would book a billed attempt whose reply can never parse, so a list is
-        unwrapped in order and non-TEXT parts are skipped (Instinct 0048 B)."""
-        if content is None:
-            return None
-        if isinstance(content, str):
-            return content if content.strip() else None
-        items = content if isinstance(content, (list, tuple)) else [content]
-        parts = []
-        for item in items:
-            if isinstance(item, str):
-                text = item
-            elif isinstance(item, dict):
-                text = item.get("text")
-            else:
-                text = getattr(item, "text", None)
-            if isinstance(text, str) and text:
-                parts.append(text)
-        if not parts:
-            return None
-        return "".join(parts)
+    _content_text = staticmethod(_shared_content_text)
     def _reply_and_usage(self, result):
         d = self._as_dict(result)
         if not isinstance(d, dict):
@@ -608,6 +589,11 @@ class OciAdapter:
             raise
 
 def build_client(cfg):  # real path (stage 1+): region from config, adapter provides .generate
+    if cfg.get("auth") == "bearer":
+        # OCI Generative AI API key (Bearer token) path: OpenAI-compatible
+        # /chat/completions, no SDK, no ~/.oci/profile. See bearer_adapter.py.
+        from bearer_adapter import BearerAdapter
+        return BearerAdapter(cfg)
     return OciAdapter(cfg)
 
 def pick_model(cfg, seed_id, ledger_rows, pair_key=None):
@@ -671,12 +657,74 @@ def validate_config(cfg, dry_run=False):
         errs.append("config error: models must be a non-empty allow-list of "
                     "{\"model_id\": ...} entries")
     if not cfg.get("region"):
-        errs.append("config error: missing region: the on-demand region for the "
-                    "model (Llama 4 on-demand is us-chicago-1, not us-ashburn-1)")
+        errs.append("config error: missing region: the region of the endpoint the "
+                    "model is called in (the API key must be in the same region)")
+    auth = cfg.get("auth", "oci")
+    if auth not in ("oci", "bearer"):
+        errs.append(f"config error: auth must be \"oci\" (IAM signing key via the SDK "
+                    f"profile) or \"bearer\" (OCI Generative AI API key token); got {auth!r}")
     comp = cfg.get("compartment_id")
-    if not comp or comp == "SET_ME":
+    if auth == "oci" and (not comp or comp == "SET_ME"):
+        # The SDK chat path sends compartment_id; the bearer chat-completions path
+        # does not (Oracle's documented request carries no compartment field), so
+        # it is not required there. Every other owner gate applies to both.
         errs.append("config error: compartment_id is unset (placeholder SET_ME): "
                     "the owner sets the tenancy compartment; refusing before auth")
+    if auth == "bearer":
+        from bearer_adapter import default_base_url, TOKEN_ENV
+        base = cfg.get("api_base_url") or (default_base_url(cfg["region"]) if cfg.get("region") else None)
+        if base:
+            from urllib.parse import urlparse
+            u = urlparse(base)
+            loopback = u.hostname in ("127.0.0.1", "localhost", "::1")
+            ok = (u.scheme == "https" and u.hostname
+                  and u.hostname.endswith(".oci.oraclecloud.com")) or \
+                 (u.scheme == "http" and loopback)   # offline test rigs only
+            if not ok:
+                errs.append(f"config error: api_base_url {base!r} must be an https URL on "
+                            "an oci.oraclecloud.com host (plain http only on loopback, "
+                            "for offline test rigs); refusing to send a token anywhere else")
+        env = cfg.get("token_env", TOKEN_ENV)
+        tok = os.environ.get(env, "")
+        if not tok.strip():
+            errs.append(f"config error: bearer auth needs the API key secret in the "
+                        f"{env} environment variable (unset). Export it on your own "
+                        "machine; never put it in the config file. Refusing before any call")
+        elif any(ord(c) < 0x21 or ord(c) > 0x7e for c in tok):
+            # C1: reject a control-char token HERE, before the run lock and any
+            # ledger write; the message never echoes the token.
+            errs.append(f"config error: {env} contains a whitespace or control "
+                        "character (a stray CR/LF from the paste). Re-enter it with "
+                        "the hidden prompt. Refusing before any call; the token is "
+                        "never echoed.")
+        temp = cfg.get("temperature")
+        if not (isinstance(temp, (int, float)) and not isinstance(temp, bool)
+                and math.isfinite(temp) and temp >= 0):
+            errs.append(f"config error: temperature must be a finite number >= 0 "
+                        f"(got {temp!r})")
+        rto = cfg.get("request_timeout_seconds", 120)
+        if not _finite_positive(rto):
+            errs.append(f"config error: request_timeout_seconds must be a finite "
+                        f"positive number (got {rto!r})")
+        ma = cfg.get("max_attempts")
+        if ma is not None and (not isinstance(ma, int) or isinstance(ma, bool) or ma <= 0):
+            errs.append(f"config error: max_attempts must be a positive whole number "
+                        f"(got {ma!r}): the owner-set request-count bound")
+        bm = cfg.get("billing_metric")
+        if bm is not None and bm != "chars":
+            errs.append(f"config error: billing_metric {bm!r}: the ledger enforces only "
+                        "char-based accounting. A token-metered model would make the "
+                        "dollar gate the wrong unit; token metering needs a different "
+                        "accounting path, not a relabeled price. Refusing before any call")
+        mtp = cfg.get("max_tokens_param", "max_tokens")
+        if mtp not in ("max_tokens", "max_completion_tokens"):
+            errs.append(f"config error: max_tokens_param {mtp!r} must be \"max_tokens\" "
+                        "or \"max_completion_tokens\": the output bound is always sent")
+        from bearer_adapter import model_billing_error
+        for m in cfg.get("models") or []:
+            e = model_billing_error(m.get("model_id") if isinstance(m, dict) else None)
+            if e:
+                errs.append(f"config error: {e}")
     budget = cfg.get("budget_usd")
     if not _finite_positive(budget):
         errs.append("config error: budget_usd must be a finite positive number "
@@ -751,11 +799,30 @@ def main():
     price = cfg.get("price_per_million_chars", 0.18)
     spent = ledger.spent_chars(); cost = spent / 1e6 * price
     attempts = ledger.attempts()
+    # The bearer endpoint's billing metric is UNVERIFIED (no Oracle doc states
+    # the unit for the OpenAI-compatible /chat/completions path), so every
+    # bearer-mode dollar figure is labelled an estimate, never a bound.
+    metering = (" (char-based estimate; endpoint billing metric UNVERIFIED)"
+                if cfg.get("auth") == "bearer" else "")
     if args.dry_run:
-        print(f"dry run: ledger has {attempts} attempts, {spent} chars, est ${cost:.2f}")
+        print(f"dry run: ledger has {attempts} attempts, {spent} chars, "
+              f"est ${cost:.2f}{metering}")
         return
-    if attempts and args.max_attempts and attempts >= args.max_attempts:
-        print(f"cap already reached across runs: {attempts} >= {args.max_attempts}"); return
+    max_attempts = args.max_attempts or int(cfg.get("max_attempts") or 0)
+    if (args.max_attempts and cfg.get("max_attempts")
+            and args.max_attempts > int(cfg["max_attempts"])):
+        # C2: the CLI may tighten the owner-set config bound, never widen it -
+        # otherwise one flag silently turns a one-request smoke into a bulk run.
+        sys.exit(f"--max-attempts {args.max_attempts} exceeds the config's "
+                 f"max_attempts {cfg['max_attempts']}: the CLI may tighten the "
+                 "owner-set bound, never widen it. Refusing before any call")
+    if cfg.get("auth") == "bearer" and not max_attempts:
+        sys.exit("bearer auth needs an owner-set request-count bound: set max_attempts "
+                 "in the config or pass --max-attempts N. The endpoint's billing metric "
+                 "is unverified, so the char-estimated dollar budget is NOT a proven "
+                 "spend bound on this path; the request count is. Refusing before any call")
+    if attempts and max_attempts and attempts >= max_attempts:
+        print(f"cap already reached across runs: {attempts} >= {max_attempts}"); return
     budget_chars = cfg["budget_usd"] / price * 1e6
     # Bound the reply term before the call: the longest Llama-4 token decodes to
     # 113 characters (DeepSeek 2137), so a reply of max_tokens tokens is at most
@@ -802,13 +869,18 @@ def main():
                 continue                    # another worker holds this pair in flight
             rec_id = f"{seed['id']}#{k+1}#{model_id.rsplit('.',1)[-1][:24]}"
             if rec_id in seeds_done: continue
-            if args.max_attempts and ledger.attempts() >= args.max_attempts:
+            if max_attempts and ledger.attempts() >= max_attempts:
                 attempts_cap_hit = True; break
             if ledger.spent_chars() + cfg["attempt_char_cap"] > budget_chars:
                 budget_hit = True; break
             # Bounded 429 retry: each retry is a NEW reserved attempt, never a
             # silent repeat of the same one (Instinct 0007 item 3).
             for try_n in range(max_retries + 1):
+                # The count bound holds ACROSS retries too: without this check a
+                # throttled pair could book attempts past max_attempts (review
+                # defect 3, 2026-11-11).
+                if max_attempts and ledger.attempts() >= max_attempts:
+                    attempts_cap_hit = True; break
                 claim = claim_seed(cfg, pk, model_id, ledger)
                 if claim is None:
                     held_seen.append(f"{pk} (held or already attempted)")
@@ -895,7 +967,7 @@ def main():
     note = "" if ledger.attempts() else (" (no attempts booked: seeds empty, budget "
                                          "exhausted, cap refusals, or cap already reached)")
     print(f"done: run {cfg['run_id']} made {made} pairs; ledger {ledger.attempts()} attempts, "
-          f"{ledger.spent_chars()} chars, est ${ledger.spent_chars()/1e6*price:.2f}{note}")
+          f"{ledger.spent_chars()} chars, est ${ledger.spent_chars()/1e6*price:.2f}{metering}{note}")
     if made == 0 and cap_refusals:
         # Zero pairs because every attempt was refused is NOT a successful run:
         # exit non-zero so rc 0 can never masquerade as calibration evidence.
@@ -906,6 +978,18 @@ def main():
                          "prompt bytes + overhead + 113 x max_tokens; raise it or "
                          "lower max_tokens.\n")
         sys.exit(3)
+    if (cfg.get("auth") == "bearer" and made == 0
+            and ledger.attempts() > attempts):
+        # F2: a bearer run that booked attempts and made no pairs FAILED (auth,
+        # availability, throttle, timeout). rc 0 would read as success in a
+        # self-run smoke test, so say so and exit non-zero; the reason lives in
+        # the ledger's status/error fields.
+        sys.stderr.write(f"FAILED run: {ledger.attempts() - attempts} attempt(s) this "
+                         f"run, 0 pairs. Read the status and error fields of "
+                         f"{cfg['ledger_path']} (those two fields only, not the raw "
+                         "file); the attempt rows are kept as spent until "
+                         "reconciliation.\n")
+        sys.exit(4)
 
 def cfg_seeds(cfg):
     return [json.loads(l) for l in open(cfg["seeds_path"]) if l.strip() and not l.startswith("#")]

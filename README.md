@@ -128,6 +128,35 @@ Dropbox original (Instinct 0446/0447), so this limit note lives here and in
 Cost math: at $0.18/M characters, $300 buys roughly 1.6 billion characters, several
 hundred million tokens of output. Embeddings run about 10x cheaper.
 
+## Bearer-token self-run (OCI Generative AI API key)
+
+If you authenticate with an OCI Generative AI API key (a secret token string,
+created in the Generative AI service) instead of an IAM signing-key profile,
+use the bearer path: no OCI CLI, no SDK, no ~/.oci/config. The runner posts to
+the OpenAI-compatible Chat Completions endpoint
+(`https://inference.generativeai.<region>.oci.oraclecloud.com/openai/v1/chat/completions`,
+https://docs.oracle.com/en-us/iaas/Content/generative-ai/chat-completions-api.htm)
+with `Authorization: Bearer <secret>`.
+
+One-request smoke test (Ashburn, Llama 4 Maverick, exactly one call, no
+retries, cumulative count bound):
+
+    python3 runner_v2.py --config gen_config.bearer.smoke.example.json --dry-run
+    python3 -c "import getpass,os,subprocess,sys; os.environ['OCI_GENAI_API_KEY']=getpass.getpass('Oracle key (hidden): '); sys.exit(subprocess.call(['python3','runner_v2.py','--config','gen_config.bearer.smoke.example.json']))"
+
+The getpass wrapper keeps the key out of your shell history and out of every
+file. Exit codes: 0 = one pair made; 4 = the attempt failed (read the status
+and error fields of smoke_ledger.jsonl, those two fields only). Dollar figures
+are labelled UNVERIFIED: no Oracle doc states the billing metric of this
+endpoint, so the enforceable bound is the request count (max_attempts 1), and
+the $0.003 figure is conditional on character metering matching the price
+list's Maverick entry. The runner refuses models whose price-list unit is not
+characters (Grok/gpt-oss are token-priced, dedicated endpoints are hourly),
+refuses to send the token to any non-Oracle host, refuses redirects, and
+refuses a token containing stray CR/LF characters from a paste. Bulk
+self-run: gen_config.bearer.example.json (requires owner-set model id,
+budget_usd, attempt_char_cap, max_attempts).
+
 ## License and provenance notes
 
 - Oracle AI Terms (rev 2026-09-16): outputs may train other AI systems; you own your
