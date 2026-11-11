@@ -363,3 +363,9 @@ of the pipeline by decision.
 **Known residuals.** (1) "fractions to decimals" (11 rows, holdout, group math-decimals) vs "fractions refresher" (14 rows, ungrouped, train). (2) Loose pairs the crew saw and left alone: "angles and triangles" (holdout) vs "basic geometry shapes" (train); "speed distance and time" (holdout) vs "time calculations" (train); gardening on a balcony (holdout, group gardening-container) vs urban gardening (train, ungrouped); organizing digital photos (holdout, group digital-photos) vs backing up photos and backing up a lifetime of photos (train, group tech-photo-backup; two declared groups on opposite sides); insurance basics (holdout, group finance-insurance) vs choosing travel insurance (train, ungrouped). Row ids are not stable across candidate revisions: cite aspects by name.
 
 **Reviewed by (offline, attributed):** coordinator rebuild (byte-identical, v1/v2/v2.1/v3 also reproduce), ChatGPT duplicate and cross-split screens, Claude group/sensitive-tag review. No runner, nested-JSON execution or OCI test of these rows.
+
+**Consumer note (2026-11-11, Instinct 1051/1052).** The consumer of these rows
+is runner_v2.py, the hardened, ledgered runner the repo's test suite covers.
+generate.py references above are historical: generate.py is legacy, has no
+execution_status gate, ledger or attempt cap, and must not be run on pack
+rows.

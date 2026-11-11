@@ -19,6 +19,7 @@ decide with counts instead of a guess.
 
 Usage:
     python3 scan_offlist.py --pairs data/batch_001.jsonl --pack pack/v2.1/bulk_prompts_v2.1.onestage.train.jsonl
+    python3 scan_offlist.py --pairs data/batch_001.jsonl --pack pack/v3.1-rev3/bulk_prompts_v3.1-rev3.onestage.train.jsonl
     python3 scan_offlist.py --pairs data/batch_001.jsonl --pack pack/... [--fail-on-hit]
 
 Offline only: reads two local JSONL files, writes nothing, no network, no key,

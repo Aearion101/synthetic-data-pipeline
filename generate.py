@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Synthetic instruction-pair generation on Oracle Cloud Generative AI (hosted, on-demand).
 
+LEGACY (Instinct 1051): no execution_status gate, no ledger, no attempt cap, no
+hold_reason, an unstable hash()-based model pick, and it prices only after the
+reply returns. Do NOT run it on pack rows: the tested entry point is
+runner_v2.py.
+
 Output is model-neutral: one plain JSONL instruction pair per line, no chat template baked
 in. Tune-time loaders own formatting, so the same file feeds any model. Languages come from
 the seed corpus; nothing here narrows them.

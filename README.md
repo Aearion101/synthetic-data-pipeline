@@ -10,13 +10,53 @@ says. Format conversion happens at tune time, not at generation.
     pip install oci
     cp gen_config.example.json gen_config.json   # set compartment_id
     # seeds.jsonl: one {"id","topic"} per line; see seeds.example.jsonl
-    python3 generate.py --config gen_config.json --dry-run
-    python3 generate.py --config gen_config.json
+    python3 runner_v2.py --config gen_config.json --dry-run
+    python3 runner_v2.py --config gen_config.json --max-attempts N --limit N
     python3 dedupe.py data/batch_001.jsonl data/batch_001.clean.jsonl
 
     # test suite (no key, no network): T22 needs the oci SDK installed; without
     # it the SDK-shape test reports sdk_ok=None and fails (Instinct 0346)
     python3 test_stage0.py
+
+generate.py is legacy and NOT for pack rows: it has no execution_status gate,
+no ledger, no attempt cap, no hold_reason, an unstable hash()-based model pick,
+prices the call only after the reply returns, and builds prompts from seed
+topics instead of the pack's rendered prompts (Instinct 1051). The tested
+entry point is runner_v2.py.
+
+## Calibration (self-run, not activated)
+
+A calibration run stays unactivated until the owner says go: nothing in this
+section calls Oracle, marks any row eligible, or collects a secret. The
+example is `gen_config.calibration.example.json`: region us-chicago-1, Llama 4
+Maverick only. Maverick and Scout are on-demand in us-chicago-1; Ashburn is
+dedicated-only for them (Oracle's Models-by-Region table).
+
+1. `pip install oci`
+2. The OCI profile is the owner's step: create `~/.oci/config` (profile
+   "DEFAULT") following Oracle's SDK config documentation. Keys never travel
+   through chat or Dropbox.
+3. Build the eligible seeds file. This is the approval step: only after the
+   owner says go.
+       jq -c 'select(.execution_status=="pending_user_approval") | {id, topic, execution_status:"eligible"}' pack/v3.1-rev3/bulk_prompts_v3.1-rev3.onestage.train.jsonl | head -n N > seeds_calib.jsonl
+   (pack/v2.1/bulk_prompts_v2.1.onestage.train.jsonl works the same way.)
+4. `python3 runner_v2.py --config gen_config.calibration.example.json --dry-run`
+5. Then the run:
+   `python3 runner_v2.py --config gen_config.calibration.example.json --max-attempts N --limit N`
+6. The ledger is `ledger_calib.jsonl`, an append-only JSONL of reservations,
+   attempts, and spend in characters with a running USD estimate; pairs land
+   at `out_path`. The runner records Oracle's usage fields verbatim, so
+   ledger spend reads back against Oracle's usage page directly.
+
+Not known before a first live call: the tenancy rate and the real billing
+ceiling (the 120,000-char attempt_char_cap is the runner's own reservation
+bound, not an Oracle limit), the real per-request character counts,
+throughput and 429 behavior, and which dated Oracle terms govern the tenancy.
+`price_per_million_chars` 0.18 is Oracle's public list price; the tenancy rate
+is unverified. `requests_per_minute` is a placeholder until a live rate
+check. `budget_usd` and `attempt_char_cap` are deliberately unset in the
+calibration example: the runner fails fast without them, and setting them is
+the owner's approval step, not a pre-filled number.
 
 Auth is the standard OCI SDK path (~/.oci/config, OCI_CLI_* env vars, or instance
 principals). Execution is gated on Dylan handing the OCI keys via secure link; nobody
@@ -56,6 +96,7 @@ creates new accounts or keys.
   a decision input with counts, not a defect verdict: the wrapper line makes
   off-list quoting legal on any row. Usage: `python3 scan_offlist.py --pairs
   data/batch_001.jsonl --pack pack/v2.1/bulk_prompts_v2.1.onestage.train.jsonl`
+  (or `--pack pack/v3.1-rev3/bulk_prompts_v3.1-rev3.onestage.train.jsonl` for the v3.1-rev3 candidate).`
   (offline, no key, no model call; `--fail-on-hit` exits 1 on findings). Coverage
   limit: only those four script ranges, so an off-list Latin-script source (Polish
   or any other) quoted inside a non-pl row is not visible to it. Tests: T33.

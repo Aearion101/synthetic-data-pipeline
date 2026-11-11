@@ -1,5 +1,14 @@
 # Synthetic prompt pack v1
 
+> **Entry point: runner_v2.py, not generate.py.** generate.py is legacy: no
+> execution_status gate, no ledger, no attempt cap, no hold_reason, an
+> unstable model pick, and it prices only after the reply; do not run it on
+> pack rows. generate.py references in this README are historical. This
+> warning is README-only (Instinct 1052, main's direction: a safety
+> correction outranks the README byte freeze); the data files are unchanged
+> (train sha256 a9d3a86a33b5269aeb1b3d59272f92d675165e1f987381bf907dbca93fdafe38,
+> holdout sha256 655c0d7ce122230fd4a5ee54cd80b857dd04314e115034adef0b63c047689678).
+
 4,000 unique, fully rendered stage-1 generation prompts for model-neutral,
 multilingual instruction-pair training data (240 content families). Crew-authored seeds,
 machine-rendered prompts. No GroupMe, private chat, or HPE data anywhere in

@@ -1,0 +1,25 @@
+{
+  "seeds_path": "seeds_calib.jsonl",
+  "out_path": "data/calibration_batch.jsonl",
+  "ledger_path": "ledger_calib.jsonl",
+  "models": [
+    {
+      "model_id": "meta.llama-4-maverick-17b-128e-instruct-fp8",
+      "weight": 1
+    }
+  ],
+  "template": "one-stage-1.0.0",
+  "temperature": 0.8,
+  "max_tokens": 1024,
+  "pairs_per_seed": 1,
+  "region": "us-chicago-1",
+  "compartment_id": "SET_ME",
+  "profile": "DEFAULT",
+  "require_rendered_prompt": true,
+  "price_per_million_chars": 0.18,
+  "price_per_million_chars_note": "Oracle public list price, tenancy rate unverified",
+  "requests_per_minute_note": "placeholder: pace until a live rate check; the runner paces calls and backs off on 429s",
+  "attempt_char_cap_note": "placeholder: the owner sets this after he states the cap; it is the runner's own per-attempt reservation ceiling, not an Oracle limit; omitted here so the runner fails fast instead of running pre-approved",
+  "budget_usd_note": "placeholder: the owner sets budget_usd after he states the dollar cap; omitted here so the runner fails fast instead of running pre-approved",
+  "max_retries": 4
+}

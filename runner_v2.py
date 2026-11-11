@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""runner_v2: Stage-0 test implementation of the Fo-1830 fix list. Local only, no repo push.
+"""runner_v2: Stage-0 test implementation of the Fo-1830 fix list; the repo's tested entry point (see README; staged on fo/stage0-runner).
 
 Fixes implemented vs repo generate.py (Aearion101/synthetic-data-pipeline HEAD):
  1 import os; 2 deterministic resume (sha256 of seed id, not hash()); 3 cumulative
