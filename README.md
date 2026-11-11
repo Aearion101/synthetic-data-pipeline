@@ -35,7 +35,11 @@ creates new accounts or keys.
   generate.py) uses json.JSONDecoder(strict=False), so a reply with a literal line
   break inside a string value (code blocks, lists, dialogue) parses where a strict
   parser would raise; json.dumps re-escapes output on the way out (Claude 0341 F1,
-  Instinct 0346/0349).
+  Instinct 0346/0349). Instinct 0646 hardening: the parser anchors on the first brace
+  candidate that decodes AND validates as the full outer pair, so a preamble with a
+  stray brace (or a valid non-pair object) no longer fails a billed reply that carries
+  a real pair later; a dict or list response is stored as JSON text (ensure_ascii=False)
+  instead of Python repr, and a non-string instruction is a bad pair shape.
 - Budget-aware: counts sent + received characters and prices them against the config rate
   (cheap Llama is about $0.18 per million characters), printing a running estimate and
   stopping at the configured budget.

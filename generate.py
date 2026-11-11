@@ -107,17 +107,53 @@ def extract_text(data):
     return max(found, key=len)
 
 def parse_pair(text):
-    m = re.search(r"\{", text)
-    if not m:
-        raise ValueError("no JSON object in reply")
-    # strict=False (Claude 0341 F1, Instinct 0346/0349 ruling): tolerant
-    # decoding accepts JSON a strict parser would reject; json.dumps
-    # re-escapes output on the way out.
-    obj, _ = json.JSONDecoder(strict=False).raw_decode(text[m.start():])
-    if not (isinstance(obj, dict) and str(obj.get("instruction", "")).strip()
-            and str(obj.get("response", "")).strip()):
-        raise ValueError("bad pair shape")
-    return str(obj["instruction"]).strip(), str(obj["response"]).strip()
+    """generate.py's parse: the first brace candidate that validates as the
+    FULL outer pair (instruction and response keys), both fields non-empty.
+    Tolerant (strict=False): literal line feeds inside string values parse.
+
+    Instinct 0646 hardening (reviewer findings on 964c79c, both copies in
+    sync):
+    1. A reply whose preamble contains a brace (or a valid non-pair JSON
+       object) no longer fails as billed-unparseable when a real pair exists
+       later: every '{' is a candidate, and the first candidate that decodes
+       AND validates as the full outer pair wins. A candidate that merely
+       decodes does not count.
+    2. A dict or list response is stored as JSON text (json.dumps,
+       ensure_ascii=False), never Python repr; a non-string instruction, or a
+       response that is neither string nor dict/list, is a bad pair shape."""
+    import re
+    dec = json.JSONDecoder(strict=False)
+    last_err = ValueError("no JSON object in reply")
+    for m in re.finditer(r"\{", text):
+        try:
+            obj, _ = dec.raw_decode(text[m.start():])
+        except json.JSONDecodeError as e:
+            last_err = e
+            continue
+        # A candidate counts only when it validates as the full outer pair:
+        # dict, non-empty string instruction, and a response that is a
+        # non-empty string or a non-empty dict/list (Instinct 0646 fix 1).
+        if not isinstance(obj, dict):
+            last_err = ValueError("bad pair shape")
+            continue
+        instr = obj.get("instruction", "")
+        resp = obj.get("response", "")
+        if not isinstance(instr, str) or not instr.strip():
+            last_err = ValueError("bad pair shape")  # Instinct 0646: non-string instruction rejected
+            continue
+        if isinstance(resp, str):
+            if not resp.strip():
+                last_err = ValueError("bad pair shape")
+                continue
+            return instr.strip(), resp.strip()
+        if isinstance(resp, (dict, list)):
+            if not resp:
+                last_err = ValueError("bad pair shape")
+                continue
+            # JSON text, not Python repr (Instinct 0646 fix 2).
+            return instr.strip(), json.dumps(resp, ensure_ascii=False)
+        last_err = ValueError("bad pair shape")
+    raise last_err
 
 def call_model(client, cfg, model_id, prompt):
     """One inference call. Cohere rides chat(); Llama rides generate_text()."""

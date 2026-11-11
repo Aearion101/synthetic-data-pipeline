@@ -631,6 +631,67 @@ def suite():
     check("T30 the same bytes fail a strict decoder (tolerance is the change)",
           strict_raised)
 
+    # T34 (Instinct 0646 fix 1, reviewer finding on 964c79c): preamble-brace
+    # anchoring. A reply whose preamble contains a brace (or a valid non-pair
+    # JSON object) failed as billed-unparseable even when a real pair existed
+    # later, because the parser anchored only on the first '{'. The fix: every
+    # '{' is a candidate, and the first candidate that decodes AND validates as
+    # the full outer pair wins; a candidate that merely decodes does not count.
+    prose_brace = 'The rules are {a, b} but here is the pair:\n{"instruction": "say hi", "response": "hi there"}'
+    got = R.parse_pair(prose_brace)
+    check("T34 preamble brace before the real pair no longer fails the reply",
+          got == ("say hi", "hi there"), f"got {got!r}")
+    decoy_first = '{"note": "pair below", "x": 1}\n{"instruction": "say hi", "response": "hi there"}'
+    got = R.parse_pair(decoy_first)
+    check("T34 a valid non-pair object is not accepted; the later pair wins",
+          got == ("say hi", "hi there"), f"got {got!r}")
+    only_decoy = '{"note": "nothing else here"}'
+    try:
+        R.parse_pair(only_decoy)
+        ok = False
+    except (ValueError, json.JSONDecodeError):
+        ok = True
+    check("T34 a reply with no validating candidate still fails", ok)
+    empty_resp = '{"instruction": "say hi", "response": ""}'
+    try:
+        R.parse_pair(empty_resp)
+        ok = False
+    except ValueError:
+        ok = True
+    check("T34 empty response stays a bad pair shape", ok)
+
+    # T35 (Instinct 0646 fix 2, reviewer finding on 964c79c): a dict or list
+    # response was stored via str(), which is Python repr (single quotes), not
+    # JSON text. The fix stores dict/list responses with json.dumps
+    # (ensure_ascii=False) and rejects a non-string instruction (previously
+    # str()-ed to repr, which could pass the shape check).
+    dict_resp = '{"instruction": "give steps", "response": {"steps": ["mix", "wait"]}}'
+    got = R.parse_pair(dict_resp)
+    check("T35 dict response stored as JSON text, not Python repr",
+          got == ("give steps", '{"steps": ["mix", "wait"]}'), f"got {got!r}")
+    list_resp = '{"instruction": "list", "response": ["a", "b"]}'
+    got = R.parse_pair(list_resp)
+    check("T35 list response stored as JSON text",
+          got == ("list", '["a", "b"]'), f"got {got!r}")
+    nonstr_instr = '{"instruction": {"en": "hi"}, "response": "hello"}'
+    try:
+        R.parse_pair(nonstr_instr)
+        ok = False
+    except ValueError:
+        ok = True
+    check("T35 a non-string instruction is rejected", ok)
+    null_resp = '{"instruction": "say hi", "response": null}'
+    try:
+        R.parse_pair(null_resp)
+        ok = False
+    except ValueError:
+        ok = True
+    check("T35 a null response is rejected, not str()-ed", ok)
+    uni_resp = '{"instruction": "say hi", "response": {"k": "\u00e9t\u00e9"}}'
+    got = R.parse_pair(uni_resp)
+    check("T35 dict response dumps with ensure_ascii=False",
+          got == ("say hi", '{"k": "été"}'), f"got {got!r}")
+
     # T31 (Instinct 0349, reviewer-reproduced): cross-process double claim from
     # the ledger tail cache. L1 caches an offset; L2 claims pair seed-1#1; L1
     # then appends an unrelated row. The old append advanced L1's cached offset
