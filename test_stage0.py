@@ -784,6 +784,25 @@ def suite():
     check("T33 unknown id with no language field: listed as unmapped, not guessed",
           S.scan_pairs_lines([{"id": "ghost#1#m", "instruction": "\u4e2d"}], {})[1][0]["id"] == "ghost#1#m")
 
+    # T36 (Instinct 1147): the legacy generate.py entry refuses before it
+    # reads the config, before any auth or network call, --dry-run included,
+    # with no opt-out flag. Offline proof: a nonexistent config path never
+    # errors as JSON, stderr names runner_v2.py, stdout stays empty, and the
+    # exit code is 2 in both modes.
+    import subprocess as SP
+    repo = os.path.dirname(os.path.abspath(__file__))
+    genv = dict(os.environ)
+    genv.setdefault("HOME", "/tmp")
+    for flags in ([], ["--dry-run"]):
+        proc = SP.run([sys.executable, "generate.py", "--config",
+                       os.path.join(repo, "no_such_config.json")] + flags,
+                      capture_output=True, text=True, cwd=repo, env=genv, timeout=30)
+        check(f"T36 legacy refusal exits 2 with{' dry-run,' if flags else ' no flags,'} "
+              f"before reading the config (stderr names runner_v2.py, stdout empty)",
+              proc.returncode == 2 and "runner_v2.py" in proc.stderr
+              and proc.stdout == "" and "Traceback" not in proc.stderr,
+              f"rc={proc.returncode} out={proc.stdout[:120]!r} err={proc.stderr[:160]!r}")
+
 def worker(cfg, n, q):
     """Same five seeds from two workers. Config arrives as an argument so the
     spawned child does not re-run the suite."""

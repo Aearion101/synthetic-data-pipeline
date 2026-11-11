@@ -37,8 +37,15 @@ dedicated-only for them (Oracle's Models-by-Region table).
    "DEFAULT") following Oracle's SDK config documentation. Keys never travel
    through chat or Dropbox.
 3. Build the eligible seeds file. This is the approval step: only after the
-   owner says go.
-       jq -c 'select(.execution_status=="pending_user_approval") | {id, topic, execution_status:"eligible"}' pack/v3.1-rev3/bulk_prompts_v3.1-rev3.onestage.train.jsonl | head -n N > seeds_calib.jsonl
+   owner says go. Keep the WHOLE row and set the status explicitly; do not
+   project. A projection like {id, topic} (a) drops the rendered prompt, so
+   the runner refuses every row under require_rendered_prompt, (b) drops the
+   hold_reason source fields (support, off_list_source_language), so the
+   language-scope hold would never fire even though about one row in seven
+   of the pack is a hold, and (c) drops execution_status itself, and the
+   runner treats a MISSING execution_status as eligible, so dropping the
+   field approves every emitted row by accident (Claude 1134).
+       jq -c 'select(.execution_status=="pending_user_approval") | .execution_status="eligible"' pack/v3.1-rev3/bulk_prompts_v3.1-rev3.onestage.train.jsonl | head -n N > seeds_calib.jsonl
    (pack/v2.1/bulk_prompts_v2.1.onestage.train.jsonl works the same way.)
 4. `python3 runner_v2.py --config gen_config.calibration.example.json --dry-run`
 5. Then the run:

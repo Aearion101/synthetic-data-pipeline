@@ -10,8 +10,9 @@ Output is model-neutral: one plain JSONL instruction pair per line, no chat temp
 in. Tune-time loaders own formatting, so the same file feeds any model. Languages come from
 the seed corpus; nothing here narrows them.
 
-    pip install oci
-    python3 generate.py --config gen_config.json [--dry-run] [--limit N]
+DISABLED (Instinct 1147, lead go): every invocation exits with a refusal before any auth or
+network call; --dry-run is included in the refusal and there is no --legacy-explicit escape.
+Kept only as a historical reference. The tested entry point is runner_v2.py (README.md).
 
 Auth is the standard OCI SDK path (~/.oci/config, OCI_CLI_* env vars, or instance
 principals). Oracle bills hosted GenAI per character, so the script counts sent + received
@@ -31,6 +32,20 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
+
+
+def legacy_refusal():
+    """Instinct 1147: generate.py is legacy and disabled. Every invocation
+    exits here, before any auth or network call and before the config is even
+    read; --dry-run is included in the refusal, and there is no
+    --legacy-explicit escape (legacy billing is not needed for the current
+    task). The tested entry point is runner_v2.py."""
+    sys.stderr.write(
+        "generate.py is legacy and disabled: no execution_status gate, no ledger, "
+        "no attempt cap, no hold_reason, and it prices only after the reply returns. "
+        "Do not run it on pack rows. The tested entry point is runner_v2.py (see "
+        "README.md); run the dry-run against runner_v2.py instead.\n")
+    sys.exit(2)
 
 try:
     import oci
@@ -288,4 +303,5 @@ def main():
     print(f"done: {made} pairs, {chars} chars, est ${cost:.2f} of ${budget:.0f} -> {out_path}")
 
 if __name__ == "__main__":
-    main()
+    legacy_refusal()   # Instinct 1147: refuses before any auth or network call;
+                       # main() below is kept as a historical reference only.
