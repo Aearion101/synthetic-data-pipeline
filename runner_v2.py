@@ -107,7 +107,7 @@ Fixes from Instinct 0048 + DeepSeek 0038 (the 42cad8e review round, 2026-11-11):
  end per 30 until then). Region, max_tokens enforcement and usage-view lag are
  stage-1 observations, not settled facts.
 """
-import argparse, fcntl, hashlib, json, os, sys, time, uuid
+import argparse, fcntl, hashlib, json, math, os, sys, time, uuid
 from datetime import datetime, timezone
 
 def now():
@@ -644,6 +644,13 @@ def acquire_run_lock(ledger_path):
 class ConfigError(Exception):
     pass
 
+def _finite_positive(value):
+    """A real, finite, positive config number. bool is excluded explicitly
+    (isinstance(True, int) is True); NaN and inf fail math.isfinite, so an
+    overflow literal like 1e309 cannot silently remove the dollar bound."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > 0)
+
 def validate_config(cfg, dry_run=False):
     """Clear, named config failure BEFORE the run lock, auth, or any network call
     (a bare KeyError on an unset owner value is a readiness defect, not a guard).
@@ -671,23 +678,32 @@ def validate_config(cfg, dry_run=False):
         errs.append("config error: compartment_id is unset (placeholder SET_ME): "
                     "the owner sets the tenancy compartment; refusing before auth")
     budget = cfg.get("budget_usd")
-    if not isinstance(budget, (int, float)) or isinstance(budget, bool) or budget <= 0:
-        errs.append("config error: budget_usd is unset or not a positive number: "
-                    "the dollar cap the ledger enforces; the owner sets it as the "
-                    "approval step; refusing before any call")
+    if not _finite_positive(budget):
+        errs.append("config error: budget_usd must be a finite positive number "
+                    f"(got {budget!r}): the dollar cap the ledger enforces; the "
+                    "owner sets it as the approval step; refusing before any call")
     price = cfg.get("price_per_million_chars", 0.18)
-    if not isinstance(price, (int, float)) or isinstance(price, bool) or price <= 0:
-        errs.append("config error: price_per_million_chars must be a positive number")
+    if not _finite_positive(price):
+        errs.append("config error: price_per_million_chars must be a finite "
+                    f"positive number (got {price!r})")
+    elif _finite_positive(budget):
+        allowance = budget / price * 1e6
+        if not math.isfinite(allowance) or allowance <= 0:
+            errs.append("config error: budget_usd / price_per_million_chars "
+                        "overflows to a non-finite char allowance (the ledger "
+                        "budget in chars); refusing before any call: a tiny "
+                        "positive price would silently remove the dollar cap")
     mt = cfg.get("max_tokens")
     if not isinstance(mt, int) or isinstance(mt, bool) or mt <= 0:
         errs.append("config error: max_tokens missing or invalid: without it no reply "
                     "term can be reserved, and the attempt would silently carry only "
                     "its prompt charge (Claude 2235 N6)")
-    if not cfg.get("attempt_char_cap"):
-        errs.append("config error: attempt_char_cap missing: the per-attempt "
-                    "reservation ceiling in chars, at least input bytes + overhead + "
-                    "the reply term (113 x max_tokens = 115,712 bytes at 1,024 tokens); "
-                    "the owner sets it")
+    cap = cfg.get("attempt_char_cap")
+    if not _finite_positive(cap) or int(cap) != cap:
+        errs.append("config error: attempt_char_cap must be a positive whole number "
+                    f"of chars (got {cap!r}): the per-attempt reservation ceiling, at "
+                    "least input bytes + overhead + the reply term (113 x max_tokens "
+                    "= 115,712 bytes at 1,024 tokens); the owner sets it")
     sp = cfg.get("seeds_path")
     if sp and not os.path.exists(sp):
         errs.append(f"config error: seeds_path {sp} does not exist")

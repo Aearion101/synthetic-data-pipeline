@@ -880,6 +880,62 @@ def suite():
           and "off-list-source-language=1" in buf40.getvalue(),
           f"out={len(out40)} stdout_tail={buf40.getvalue()[-200:]!r}")
 
+    # T41 (ChatGPT 14:05 cases, coordinator-reproduced): non-finite or
+    # wrong-type owner values fail with a NAMED error before the run lock -
+    # an inf/NaN budget would silently remove the dollar bound.
+    def t41_reject(key, bad):
+        cfg = fresh(); write_seeds(cfg, 1); cfg[key] = bad
+        d = os.path.dirname(cfg["seeds_path"]); p = os.path.join(d, "cfg41.json")
+        json.dump(cfg, open(p, "w")); sys.argv = ["runner_v2.py", "--config", p]
+        try:
+            R.main(); ok = False
+        except SystemExit as e:
+            ok = key in str(e)
+        check(f"T41 {key}={bad!r} rejected with a named error, before the lock",
+              ok and not os.path.exists(cfg["ledger_path"] + ".runlock"),
+              f"ok={ok}")
+    for bad in (float("inf"), 1e309, float("nan"), -5, 0, "300", True):
+        t41_reject("budget_usd", bad)
+    for bad in (float("inf"), float("nan"), -1, "0.18"):
+        t41_reject("price_per_million_chars", bad)
+    for bad in ("120000", True, -1, 0, float("nan"), 120000.5):
+        t41_reject("attempt_char_cap", bad)
+    ok41 = True
+    for good in (300, 300.0):
+        cfg = fresh(); write_seeds(cfg, 1); cfg["budget_usd"] = good
+        try:
+            R.validate_config(cfg)
+        except R.ConfigError:
+            ok41 = False
+    cfg = fresh(); write_seeds(cfg, 1); cfg["attempt_char_cap"] = 120000.0
+    try:
+        R.validate_config(cfg)                       # integral float accepted
+    except R.ConfigError:
+        ok41 = False
+    check("T41 valid values still accepted (finite budget, integral cap)",
+          ok41)
+
+    # T42: a tiny positive price (1e-320) passes _finite_positive but makes the
+    # derived char allowance budget/price*1e6 overflow to inf - named refusal
+    # before the lock; realistic prices stay accepted.
+    cfg = fresh(); write_seeds(cfg, 1); cfg["price_per_million_chars"] = 1e-320
+    d = os.path.dirname(cfg["seeds_path"]); p = os.path.join(d, "cfg42.json")
+    json.dump(cfg, open(p, "w")); sys.argv = ["runner_v2.py", "--config", p]
+    try:
+        R.main(); ok = False
+    except SystemExit as e:
+        ok = "overflows" in str(e) and "price_per_million_chars" in str(e)
+    check("T42 tiny price (derived allowance overflow) named refusal, before the lock",
+          ok and not os.path.exists(cfg["ledger_path"] + ".runlock"), f"ok={ok}")
+    ok42 = True
+    for good in (0.18, 1e6, 1e-10):
+        cfg = fresh(); write_seeds(cfg, 1); cfg["price_per_million_chars"] = good
+        try:
+            R.validate_config(cfg)
+        except R.ConfigError:
+            ok42 = False
+    check("T42 valid prices still accepted (derived allowance finite)", ok42)
+
 def worker(cfg, n, q):
     """Same five seeds from two workers. Config arrives as an argument so the
     spawned child does not re-run the suite."""
