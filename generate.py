@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """Synthetic instruction-pair generation on Oracle Cloud Generative AI (hosted, on-demand).
 
+LEGACY (Instinct 1051): no execution_status gate, no ledger, no attempt cap, no
+hold_reason, an unstable hash()-based model pick, and it prices only after the
+reply returns. Do NOT run it on pack rows: the tested entry point is
+runner_v2.py.
+
 Output is model-neutral: one plain JSONL instruction pair per line, no chat template baked
 in. Tune-time loaders own formatting, so the same file feeds any model. Languages come from
 the seed corpus; nothing here narrows them.
 
-    pip install oci
-    python3 generate.py --config gen_config.json [--dry-run] [--limit N]
+DISABLED (Instinct 1147, lead go): every invocation exits with a refusal before any auth or
+network call; --dry-run is included in the refusal and there is no --legacy-explicit escape.
+Kept only as a historical reference. The tested entry point is runner_v2.py (README.md).
 
 Auth is the standard OCI SDK path (~/.oci/config, OCI_CLI_* env vars, or instance
 principals). Oracle bills hosted GenAI per character, so the script counts sent + received
@@ -37,6 +43,20 @@ import sys
 import time
 import zlib
 from datetime import datetime, timezone
+
+
+def legacy_refusal():
+    """Instinct 1147: generate.py is legacy and disabled. Every invocation
+    exits here, before any auth or network call and before the config is even
+    read; --dry-run is included in the refusal, and there is no
+    --legacy-explicit escape (legacy billing is not needed for the current
+    task). The tested entry point is runner_v2.py."""
+    sys.stderr.write(
+        "generate.py is legacy and disabled: no execution_status gate, no ledger, "
+        "no attempt cap, no hold_reason, and it prices only after the reply returns. "
+        "Do not run it on pack rows. The tested entry point is runner_v2.py (see "
+        "README.md); run the dry-run against runner_v2.py instead.\n")
+    sys.exit(2)
 
 try:
     import oci
@@ -98,14 +118,53 @@ def extract_text(data):
     return max(found, key=len)
 
 def parse_pair(text):
-    m = re.search(r"\{", text)
-    if not m:
-        raise ValueError("no JSON object in reply")
-    obj, _ = json.JSONDecoder().raw_decode(text[m.start():])
-    if not (isinstance(obj, dict) and str(obj.get("instruction", "")).strip()
-            and str(obj.get("response", "")).strip()):
-        raise ValueError("bad pair shape")
-    return str(obj["instruction"]).strip(), str(obj["response"]).strip()
+    """generate.py's parse: the first brace candidate that validates as the
+    FULL outer pair (instruction and response keys), both fields non-empty.
+    Tolerant (strict=False): literal line feeds inside string values parse.
+
+    Instinct 0646 hardening (reviewer findings on 964c79c, both copies in
+    sync):
+    1. A reply whose preamble contains a brace (or a valid non-pair JSON
+       object) no longer fails as billed-unparseable when a real pair exists
+       later: every '{' is a candidate, and the first candidate that decodes
+       AND validates as the full outer pair wins. A candidate that merely
+       decodes does not count.
+    2. A dict or list response is stored as JSON text (json.dumps,
+       ensure_ascii=False), never Python repr; a non-string instruction, or a
+       response that is neither string nor dict/list, is a bad pair shape."""
+    import re
+    dec = json.JSONDecoder(strict=False)
+    last_err = ValueError("no JSON object in reply")
+    for m in re.finditer(r"\{", text):
+        try:
+            obj, _ = dec.raw_decode(text[m.start():])
+        except json.JSONDecodeError as e:
+            last_err = e
+            continue
+        # A candidate counts only when it validates as the full outer pair:
+        # dict, non-empty string instruction, and a response that is a
+        # non-empty string or a non-empty dict/list (Instinct 0646 fix 1).
+        if not isinstance(obj, dict):
+            last_err = ValueError("bad pair shape")
+            continue
+        instr = obj.get("instruction", "")
+        resp = obj.get("response", "")
+        if not isinstance(instr, str) or not instr.strip():
+            last_err = ValueError("bad pair shape")  # Instinct 0646: non-string instruction rejected
+            continue
+        if isinstance(resp, str):
+            if not resp.strip():
+                last_err = ValueError("bad pair shape")
+                continue
+            return instr.strip(), resp.strip()
+        if isinstance(resp, (dict, list)):
+            if not resp:
+                last_err = ValueError("bad pair shape")
+                continue
+            # JSON text, not Python repr (Instinct 0646 fix 2).
+            return instr.strip(), json.dumps(resp, ensure_ascii=False)
+        last_err = ValueError("bad pair shape")
+    raise last_err
 
 def call_model(client, cfg, model_id, prompt):
     """One inference call. Cohere rides chat(); Llama rides generate_text()."""
@@ -364,4 +423,5 @@ def main():
     print(f"done: {made} pairs, {chars} chars, est ${cost:.2f} of ${budget:.0f} -> {out_path}")
 
 if __name__ == "__main__":
-    main()
+    legacy_refusal()   # Instinct 1147: refuses before any auth or network call;
+                       # main() below is kept as a historical reference only.
