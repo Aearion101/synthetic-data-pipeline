@@ -157,6 +157,146 @@ refuses a token containing stray CR/LF characters from a paste. Bulk
 self-run: gen_config.bearer.example.json (requires owner-set model id,
 budget_usd, attempt_char_cap, max_attempts).
 
+## Bounded parallel calls (local candidate, offline-tested)
+
+The one-request smoke configuration remains serial and unchanged. The bulk
+example opts into two worker threads with a shared one-second minimum admission
+interval. These are cautious pilot settings, not measured Oracle tenancy limits.
+No live throughput or cost measurement has been made.
+
+    "workers": 2,
+    "min_request_interval_seconds": 1.0,
+    "max_attempts": 5,
+    "max_retries": 2
+
+After the smoke, set the model, paths, request count, per-attempt reservation,
+and estimated-char budget in your own config. The example's five-attempt cap
+is a small pilot, not permission or a configuration for 12,000 requests. Keep
+prompt-pack execution and language holds in place. `pairs_per_seed` defaults
+to four unless overridden, and each seed's `n_pairs` wins: 12,000 seed rows do
+not necessarily mean 12,000 calls.
+
+`workers` bounds in-flight requests (1..16); `--workers N` can only lower the
+config value. The process-wide pacer spaces admissions across all workers,
+including retries. On HTTP 429, it doubles spacing and moves the shared next
+admission back (up to at least 60 seconds). Already-admitted calls can still
+finish. Waiting workers recheck the new deadline. Successful responses do not
+automatically increase throughput. Raise concurrency or decrease spacing only
+after measurement, not by guessing Oracle's dynamic, undocumented limit:
+https://docs.oracle.com/en-us/iaas/Content/generative-ai/dynamic-throttling.htm
+
+Before any request reservation, the parallel path preflights all eligible,
+non-held rows for required rendered prompts. A bad row anywhere in the pack
+refuses startup with a named error and zero calls, not a late failure after
+other workers have started. Held rows remain held. On an unexpected coordinator
+exception, admissions stop and outstanding futures are drained: admitted replies
+are persisted where possible and never-admitted reservations are released. Exit 6
+reports a fixed coordinator-failure message rather than a raw traceback. Ctrl-C
+still exits 130; persistence failures still exit 5. A settlement that itself
+fails is not replayed automatically because its output may already be durable;
+its reservation remains blocked for reconciliation, while other futures drain.
+
+One coordinator owns ledger and output writes. Before dispatch, it atomically
+reserves the request count and full estimated input/reply term. In-flight calls
+and retries count against the same cumulative bounds. `--limit` includes
+potential in-flight successes, so parallelism cannot overshoot it. Only a
+bounded number of jobs are submitted; the runner does not queue 12,000 calls
+or launch separate processes with separate ledgers to evade the shared bounds.
+A second process on the same ledger still refuses to start.
+
+For resume, keep the SAME config, output, and ledger. Completed work is skipped.
+A timeout, unknown result, or pending reservation is not automatically retried:
+it may already have been billed. Valid pairs are written, flushed and synced
+BEFORE the ledger marks their attempts completed. An output/ledger write failure
+stops admissions and exits 5 with a fixed persistence warning; already-admitted
+calls are drained where possible, and uncertain reservations stay counted.
+
+On startup, legacy completed rows without matching output records refuse new
+calls and exit 5 with a reconciliation warning, even if the request cap is already
+reached. Durable output paired with a pending ledger row is visibly reported,
+skipped without another call, and left conservatively counted for reconciliation.
+New output rows record their attempt id; old records use their existing pair/model
+id for matching. Duplicate output ids, incomplete tails and invalid pair records
+are refused rather than silently repaired. Never delete the ledger to restart.
+
+Reconcile uncertain attempts against saved output and the tenancy's billing
+records before any manual change. Reordering cannot recover a reply that was
+never successfully written: an abrupt kill or disk failure can still lose up to
+the in-flight worker count of replies, but those reservations remain blocked
+rather than being falsely completed or silently re-billed. On Ctrl-C, new
+admissions stop, waiting requests are released without a call, and already-admitted
+calls are allowed to settle. POSIX SIGINT is briefly deferred across reservation
+and future registration, and across each output/ledger settlement: a signal in
+those windows is delivered once the reservation has a drain-visible future or
+the settlement has finished. If executor submission raises without returning a
+future, the reservation remains pending, spent and blocked: submission may have
+queued work before raising. The runner stops admissions and reports uncertainty;
+it never assumes an exception proves that no request was sent, including when
+submission raises KeyboardInterrupt. A partial-submit reply may be unrecoverable
+without its future, but it cannot free the count allowance or authorize a retry. An abrupt kill leaves reservations held on the next
+run. The already-published serial smoke path has not been changed by this follow-up.
+
+Dollar figures remain UNVERIFIED char-based estimates, not a proven spend cap.
+The shared request-count bound is enforceable; completion `usage` fields do not
+prove the billing unit or actual charge. The bearer adapter's fixed diagnostics,
+typed usage/finish fields, and full-credential echo refusal are unchanged. As
+before, a partial credential embedded in normal-looking successful model text
+cannot be reliably distinguished from ordinary output and could reach the dataset.
+
+Offline checks (no Oracle access):
+
+    python3 test_stage0.py
+    python3 test_bearer.py
+    python3 test_parallel.py
+
+## Parallel pilot from the prompt pack (run only after the serial smoke passes)
+
+Offline-tested only (a loopback stub, 12 seeds, 2 workers: 12 pairs, ledger all
+completed, a second run on the same ledger made no call). No live Oracle call
+has been made with this code. Dollar figures stay UNVERIFIED; the request count
+(`max_attempts`) is the enforceable bound. Needs only Python 3 (stdlib).
+
+1. Make a small language-spread seeds file. `--approve` is your own
+   acknowledgment that these rows are the ones you chose: it marks them
+   eligible and makes no call. It authorizes no one else to run them. It keeps
+   whole pack rows, skips rows the runner would hold, and sets `n_pairs` so
+   planned pairs = seeds x pairs-per-seed:
+
+       python3 make_seeds.py --pack pack/v3.1-rev3/bulk_prompts_v3.1-rev3.onestage.train.jsonl --n 12 --out seeds_pilot.jsonl --approve
+
+2. Copy `gen_config.bearer.example.json` to `gen_config.pilot.json` and set:
+   `model_id` (the exact id your Ashburn account exposes), `budget_usd`,
+   `attempt_char_cap` (120000 at max_tokens 1024), `max_attempts`, `seeds_path`
+   `seeds_pilot.jsonl`, `out_path` `pilot_pairs.jsonl`, `ledger_path`
+   `pilot_ledger.jsonl`. Keep `workers` 2 and `min_request_interval_seconds`
+   1.0 until measured.
+
+   Choose max_attempts as the total raw-request ceiling you accept across ALL
+   runs on this ledger, including retries and uncertain/failed attempts. For a
+   first 12-row pilot, choose max_attempts=12 and max_retries=0 only after the
+   one-request smoke and billing check and only if you accept up to 12
+   requests. This ceiling may yield fewer than 12 valid pairs; do not increase
+   it just to finish the rows. Keep the same ledger, output and ceiling on
+   resume. budget_usd remains a character-based estimate, not a proven dollar
+   cap.
+
+3. `python3 runner_v2.py --config gen_config.pilot.json --dry-run` prints the
+   ledger readout only. It does not count seeds and does not prove the seeds file exists.
+
+4. Run (key stays hidden; the exit code prints right after):
+
+       python3 -c "import getpass,os,subprocess,sys; os.environ['OCI_GENAI_API_KEY']=getpass.getpass('Oracle key (hidden): '); sys.exit(subprocess.call(['python3','runner_v2.py','--config','gen_config.pilot.json']))"
+       printf 'exit code: %s\n' "$?"
+
+5. For a fresh full pilot, this run's done line must report the planned number
+   of pairs, the output must grow by that number, and those attempts must be
+   completed in the ledger. On resume, the done line counts only NEW pairs from
+   that run. Check output growth against that line and cumulative completed
+   pair IDs against the planned seed/pair set. Zero exit status alone proves
+   neither full completion nor a successful new call. Never delete the ledger,
+   reset allowance or raise the request ceiling automatically to finish
+   missing pairs.
+
 ## License and provenance notes
 
 - Oracle AI Terms (rev 2026-09-16): outputs may train other AI systems; you own your

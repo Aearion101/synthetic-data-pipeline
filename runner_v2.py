@@ -725,6 +725,19 @@ def validate_config(cfg, dry_run=False):
             e = model_billing_error(m.get("model_id") if isinstance(m, dict) else None)
             if e:
                 errs.append(f"config error: {e}")
+    workers = cfg.get("workers", 1)
+    if (isinstance(workers, bool) or not isinstance(workers, int)
+            or not 1 <= workers <= 16):
+        errs.append("config error: workers must be a whole number 1..16")
+    elif workers > 1 and cfg.get("auth") != "bearer":
+        errs.append("config error: parallel workers currently require bearer auth")
+    interval = cfg.get("min_request_interval_seconds", 1.0)
+    if not (_finite_positive(interval) and interval <= 60):
+        errs.append("config error: min_request_interval_seconds must be finite, "
+                    "positive and <= 60; shared pacing never guesses Oracle limits")
+    retries = cfg.get("max_retries", 2)
+    if isinstance(retries, bool) or not isinstance(retries, int) or not 0 <= retries <= 10:
+        errs.append("config error: max_retries must be a whole number 0..10")
     budget = cfg.get("budget_usd")
     if not _finite_positive(budget):
         errs.append("config error: budget_usd must be a finite positive number "
@@ -779,6 +792,8 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--max-retries", type=int, default=None,
                     help="bounded retries per pair after a 429; default from config")
+    ap.add_argument("--workers", type=int, default=None,
+                    help="worker threads: may tighten config workers, never widen it")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     cfg = json.load(open(args.config))
@@ -790,6 +805,11 @@ def main():
         validate_config(cfg, dry_run=args.dry_run)
     except ConfigError as e:
         sys.exit(str(e))
+    workers = args.workers if args.workers is not None else cfg.get("workers", 1)
+    if not 1 <= workers <= cfg.get("workers", 1):
+        sys.exit("--workers may tighten the config bound, never widen it")
+    if args.max_retries is not None and not 0 <= args.max_retries <= 10:
+        sys.exit("--max-retries must be 0..10")
     run_lock_fd = acquire_run_lock(cfg["ledger_path"])
     if run_lock_fd is None:
         sys.stderr.write("another runner process holds the run lock on this ledger; "
@@ -821,6 +841,21 @@ def main():
                  "in the config or pass --max-attempts N. The endpoint's billing metric "
                  "is unverified, so the char-estimated dollar budget is NOT a proven "
                  "spend bound on this path; the request count is. Refusing before any call")
+    use_pool = (cfg.get("workers", 1) > 1 or
+                (cfg.get("auth") == "bearer" and
+                 "min_request_interval_seconds" in cfg))
+    if use_pool:
+        from parallel_runner import check_resume, PersistenceError
+        try:
+            check_resume(sys.modules[__name__], cfg, ledger)
+        except (ConfigError, PersistenceError, OSError):
+            # Fixed messages below for I/O; preserve reconciliation detail for
+            # our own errors without exposing underlying file contents.
+            error = sys.exc_info()[1]
+            message = (str(error) if isinstance(error, (ConfigError, PersistenceError))
+                       else "PERSISTENCE FAILED: cannot inspect ledger/output; reconcile before resuming")
+            sys.stderr.write(message + "\n")
+            sys.exit(5)
     if attempts and max_attempts and attempts >= max_attempts:
         print(f"cap already reached across runs: {attempts} >= {max_attempts}"); return
     budget_chars = cfg["budget_usd"] / price * 1e6
@@ -839,7 +874,31 @@ def main():
     cap_refusals = 0
     held_seen = []
     budget_hit = attempts_cap_hit = False
-    for seed in cfg_seeds(cfg):
+    interrupted = False
+    if use_pool:
+        from parallel_runner import run_parallel, CoordinatorError
+        try:
+            result = run_parallel(sys.modules[__name__], cfg, ledger, workers=workers,
+                                  interval=cfg.get("min_request_interval_seconds", 1.0),
+                                  max_attempts=max_attempts, budget_chars=budget_chars,
+                                  max_out_chars=max_out_chars, overhead=overhead,
+                                  max_retries=max_retries, n_max=n_max)
+        except PersistenceError as error:
+            sys.stderr.write(str(error) + "\n")
+            sys.exit(5)
+        except (CoordinatorError, ConfigError):
+            sys.stderr.write("COORDINATOR FAILED: stopped admissions and drained "
+                             "outstanding calls where possible; resume with the SAME "
+                             "files and reconcile any reported uncertainty.\n")
+            sys.exit(6)
+        made = result["made"]
+        skipped_status = result["skipped_status"]
+        cap_refusals = result["cap_refusals"]
+        held_seen = result["held_seen"]
+        budget_hit = result["budget_hit"]
+        attempts_cap_hit = result["attempts_cap_hit"]
+        interrupted = result["interrupted"]
+    for seed in ([] if use_pool else cfg_seeds(cfg)):
         if made >= n_max or budget_hit or attempts_cap_hit:
             break
         # Prompt-pack gate (Instinct 0010): only execution_status="eligible" rows run.
@@ -968,6 +1027,10 @@ def main():
                                          "exhausted, cap refusals, or cap already reached)")
     print(f"done: run {cfg['run_id']} made {made} pairs; ledger {ledger.attempts()} attempts, "
           f"{ledger.spent_chars()} chars, est ${ledger.spent_chars()/1e6*price:.2f}{metering}{note}")
+    if interrupted:
+        sys.stderr.write("Interrupted: stopped new admissions; dispatched calls settled. "
+                         "Uncertain attempts remain spent and blocked on resume.\n")
+        sys.exit(130)
     if made == 0 and cap_refusals:
         # Zero pairs because every attempt was refused is NOT a successful run:
         # exit non-zero so rc 0 can never masquerade as calibration evidence.
