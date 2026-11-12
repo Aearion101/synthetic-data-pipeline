@@ -337,13 +337,19 @@ the config's `templates` list (defaults to all four):
 - `pair-why-v1` direct answer plus a "Why this works:" reasoning paragraph
 - `pair-edge-v1` misconception / tradeoff / scale-stress angles for harder pairs
 
-`make_seeds.py` builds the starter corpus (100 topics across 10 domains, optional
-language variants, `--langs en,id,es`, no API calls) into `seeds.jsonl`.
+`make_seeds_legacy_grid.py` (renamed from `make_seeds.py`, contents unchanged) builds the
+legacy starter corpus (100 topics across 10 domains, optional language variants,
+`--langs en,id,es`, no API calls) into `seeds.jsonl` for the legacy `generate.py`.
+`make_seeds.py` is now the pack-based pilot seed picker described under "Parallel
+pilot from the prompt pack".
 
-## Smoke test path
+## Smoke test path (legacy, `generate.py` is disabled: it refuses before any call)
+
+For the current path use `runner_v2.py` and the serial smoke and parallel pilot sections
+above. The block below is kept only as a record of the old flow.
 
 ```
-python3 make_seeds.py --out seeds.jsonl
+python3 make_seeds_legacy_grid.py --out seeds.jsonl
 python3 generate.py --config gen_config.json --limit 20     # first paid calls, ~20 pairs
 python3 dedupe.py --in <out>                                # quality gate
 ```
