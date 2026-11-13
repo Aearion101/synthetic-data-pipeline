@@ -6,7 +6,7 @@
   "models": [{"model_id": "meta.llama-4-maverick-17b-128e-instruct-fp8", "weight": 1}],
   "comment_model": "Llama 4 Maverick, the id on your access list. This is our pick for the smoke test, named visibly; it settles whether your Ashburn key reaches an on-demand Llama 4.",
   "max_attempts": 1,
-  "comment_max_attempts": "Hard count bound: exactly one request, cumulative across runs. Re-running this config will not send a second request - delete the ledger file to reset, or raise this.",
+  "comment_max_attempts": "Hard count bound: exactly one request, cumulative across runs. Re-running this config will not send a second request. Do not delete or move the ledger to get another try: it is the record of what was already sent. If the outcome is unknown or the attempt failed, read the status and error fields of the ledger first and keep the file. Raising this number is the owner's own decision.",
   "max_retries": 0,
   "comment_retries": "No retries: a 429 or failure ends the test instead of spending again.",
   "max_tokens": 128,
