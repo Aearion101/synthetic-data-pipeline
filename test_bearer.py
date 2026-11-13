@@ -162,11 +162,25 @@ def run():
     try:
         a.generate("m", "p", cfg); check("T4 500", False, "no raise")
     except RuntimeError as e:
-        check("T4 500", str(e).startswith("HTTP 500 from chat completions [POST 127.0.0.1/"), str(e))
-        check("T4 route shown", "/20231130/actions/v1/chat/completions]" in str(e), str(e))
+        check("T4 500", str(e).startswith("HTTP 500 from chat completions [POST <non-default route>]"), str(e))
+        check("T4 custom route masked", "<non-default route>" in str(e) and "127.0.0.1" not in str(e), str(e))
         check("T4 no body/prefix", TOKEN not in str(e) and TOKEN[:40] not in str(e)
               and "bad key" not in str(e), str(e))
     srv.shutdown()
+
+    # T4b default Oracle route shown; enum code shown; token==enum code never echoed
+    a = B.BearerAdapter(fresh({"region": "us-chicago-1"}))
+    check("T4b route", a._route() == "inference.generativeai.us-chicago-1.oci.oraclecloud.com/openai/v1/chat/completions", a._route())
+    a = B.BearerAdapter(fresh({"region": "us-chicago-1", "api_base_url": "https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/secretpath/v1"}))
+    check("T4b secret path masked", "secretpath" not in a._route(), a._route())
+    class FakeErr:
+        def __init__(s, b): s.b = b
+        def read(s, n): return s.b
+    a = B.BearerAdapter(fresh())
+    check("T4b enum code", a._known_error_code(FakeErr(b'{"code":"NotAuthorizedOrNotFound","message":"x"}')) == "NotAuthorizedOrNotFound")
+    check("T4b unknown dropped", a._known_error_code(FakeErr(b'{"code":"Whatever"}')) is None)
+    a._token = "NotFound"
+    check("T4b token==enum dropped", a._known_error_code(FakeErr(b'{"code":"NotFound"}')) is None)
 
     # T5 missing token env -> named config error at construction, zero requests
     os.environ.pop(TEST_ENV, None)
@@ -591,7 +605,7 @@ def run():
     try:
         a.generate("m", "p", cfg); check("T30 long-token 500", False, "no raise")
     except RuntimeError as e:
-        check("T30 long-token 500", str(e).startswith("HTTP 500 from chat completions [POST 127.0.0.1/")
+        check("T30 long-token 500", str(e).startswith("HTTP 500 from chat completions [POST <non-default route>]")
               and TOKEN not in str(e) and PREFIX not in str(e), str(e))
     srv.shutdown()
 

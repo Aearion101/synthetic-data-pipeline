@@ -76,7 +76,7 @@ approval yet and would be one owner-approved call, must confirm):
 - whether the owner's Ashburn-scoped key reaches the model he names (Oracle's
   availability table lists Llama 4 in Ashburn as dedicated-cluster only).
 """
-import json, os, socket, urllib.request, urllib.error, urllib.parse
+import json, os, re, socket, urllib.request, urllib.error, urllib.parse
 
 # runner_common, never runner_v2: when runner_v2 runs as a script it is
 # __main__, and importing it here would load a SECOND copy whose
@@ -98,6 +98,8 @@ USAGE_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens")
 KNOWN_ERROR_CODES = frozenset({"NotAuthorizedOrNotFound", "NotFound", "Unauthorized",
     "InvalidParameter", "TooManyRequests", "LimitExceeded", "InternalServerError",
     "model_not_found", "invalid_api_key", "not_found"})
+KNOWN_PATHS = frozenset({"/openai/v1/chat/completions",
+                        "/20231130/actions/v1/chat/completions"})
 FINISH_REASONS = ("stop", "length", "content_filter", "tool_calls")
 
 
@@ -206,8 +208,15 @@ class BearerAdapter:
         return text.replace(self._token, "<redacted>") if self._token in text else text
 
     def _route(self):
+        # Shown only when it is exactly a documented Oracle shape; any custom
+        # host or path (which could carry a secret) is replaced by a fixed label.
         u = urllib.parse.urlsplit(self.url)
-        return f"{u.hostname}{u.path}"
+        host_ok = bool(re.fullmatch(r"inference\.generativeai\.[a-z0-9-]{3,30}\.oci\.oraclecloud\.com",
+                                    u.hostname or ""))
+        path_ok = u.path in KNOWN_PATHS
+        if host_ok and path_ok and self._token not in u.hostname + u.path:
+            return f"{u.hostname}{u.path}"
+        return "<non-default route>"
 
     def _known_error_code(self, err):
         try:
@@ -215,7 +224,11 @@ class BearerAdapter:
             code = data.get("code") or (data.get("error") or {}).get("code")
         except Exception:
             return None
-        return code if isinstance(code, str) and code in KNOWN_ERROR_CODES else None
+        if not (isinstance(code, str) and code in KNOWN_ERROR_CODES):
+            return None
+        if self._token and (self._token in code or code in self._token):
+            return None  # a credential equal to / containing the code is never echoed
+        return code
 
     def generate(self, model_id, prompt, cfg):
         body = {
