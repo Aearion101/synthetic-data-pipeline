@@ -1,11 +1,142 @@
 # synthetic-data-pipeline
 
-Synthetic instruction-pair generation on Oracle Cloud Generative AI (hosted, on-demand),
-paid from the $300 promo credits (expire Nov 15, 2026). The output is model-neutral: plain
-JSONL instruction pairs, no chat template baked in, languages whatever the seed corpus
-says. Format conversion happens at tune time, not at generation.
+Synthetic instruction-pair generation on Oracle Cloud Generative AI (hosted, on-demand).
+The output is model-neutral JSONL instruction pairs, no chat template baked in, languages
+whatever the seed corpus says. Format conversion happens at tune time, not at generation.
 
-## Quickstart
+Nothing here has been run against the live Oracle service yet. Everything below was tested
+offline (stub server, unit tests). The owner runs the live steps with their own key.
+
+## Start here: owner-run path
+
+Python 3, standard library only, no pip install. Do these in order. The pilot (step 3) comes only after
+the smoke (step 1) passed and you looked at its output.
+
+### 0. Get the code
+
+    git clone https://github.com/Aearion101/synthetic-data-pipeline.git
+    cd synthetic-data-pipeline
+    python3 --version
+
+Optional offline check (no key, no network): `python3 test_make_seeds.py` and
+`python3 test_parallel.py`. `test_stage0.py` needs the `oci` package for 3 of its tests.
+
+### 1. Smoke test: exactly ONE request
+
+Config: `gen_config.bearer.smoke.example.json`. Use it unedited. It sets Ashburn
+(us-ashburn-1), model `meta.llama-4-maverick-17b-128e-instruct-fp8`, `max_attempts` 1,
+`max_retries` 0, `max_tokens` 128, `attempt_char_cap` 16384, seeds
+`seeds_smoke.example.jsonl`, output `smoke_pairs.jsonl`, ledger `smoke_ledger.jsonl`.
+
+Whether Oracle serves this model on-demand in Ashburn for your key is exactly what this
+test finds out. Oracle's model page lists Llama 4 Maverick on-demand in Chicago only.
+
+Dry-run first (no key, no network):
+
+    python3 runner_v2.py --config gen_config.bearer.smoke.example.json --dry-run
+
+It should print `ledger has 0 attempts`. If it shows a spent attempt, stop and read the
+ledger's status and error fields before anything else.
+
+The one live request. Paste your key at the hidden prompt. It stays in this process only,
+not in shell history or any file:
+
+    python3 -c "import getpass,os,subprocess,sys; os.environ['OCI_GENAI_API_KEY']=getpass.getpass('Oracle key (hidden): '); sys.exit(subprocess.call(['python3','runner_v2.py','--config','gen_config.bearer.smoke.example.json']))"
+    printf 'exit code: %s\n' "$?"
+
+Run the `printf` line as its own command, right after.
+
+Pass means all three, for this run:
+- a line `done: run <id> made 1 pairs`;
+- one ledger row with status `completed`;
+- `smoke_pairs.jsonl` has exactly 1 line. Read that pair yourself.
+
+Exit 0 alone is not a pass. Exit 4 means the attempt failed: read only the `status` and
+`error` fields of `smoke_ledger.jsonl`. A model or availability error from Oracle may mean
+Ashburn does not serve this model on-demand for your key (see the Maverick note above);
+switching region means a new key and a changed config, which is your decision.
+
+Re-running the smoke makes no second request: the one-request ceiling is already spent.
+Never delete, move or edit the ledger to get another try. It is the record of what was
+sent. If the outcome is unknown, inspect it first.
+
+### 2. Between smoke and pilot
+
+Look at the pair and decide whether to go on. Check your Oracle
+usage and cost pages for the smoke call (OCI Console, Billing & Cost Management, Cost
+Analysis: https://docs.oracle.com/en-us/iaas/Content/Billing/Concepts/costanalysisoverview.htm).
+This repo does not know how long usage takes to appear for Generative AI, so it may not
+be there yet.
+
+### 3. Parallel pilot from the prompt pack
+
+Two worker threads, 1 second minimum spacing between request starts. These are cautious
+settings, not measured Oracle limits.
+
+a. Build a small language-spread seeds file. `--approve` records that these are the rows
+   you chose. It marks them eligible and makes no call. It authorizes no one else to run
+   them. The helper skips rows the runner would hold, keeps whole rows, and sets `n_pairs`:
+
+       python3 make_seeds.py --pack pack/v3.1-rev3/bulk_prompts_v3.1-rev3.onestage.train.jsonl --n 12 --out seeds_pilot.jsonl --approve
+
+b. Copy the template and edit your copy:
+
+       cp gen_config.bearer.example.json gen_config.pilot.json
+
+   Set `model_id` (the id that worked in step 1), `budget_usd`, `attempt_char_cap`,
+   `max_attempts`, `max_retries`, `seeds_path` `seeds_pilot.jsonl`, `out_path`
+   `pilot_pairs.jsonl`, `ledger_path` `pilot_ledger.jsonl`. Keep `workers` 2 and
+   `min_request_interval_seconds` 1.0 until measured. The template's `max_attempts` 5 and
+   `max_retries` 2 are its own defaults, not a recommendation.
+   - `attempt_char_cap`: 120000 works at `max_tokens` 1024 (each attempt reserves prompt
+     bytes + 200 + 113 x max_tokens, about 116,950 for the largest prompt in the pack).
+     A smaller number refuses every attempt before anything is sent.
+   - `max_attempts` is the total raw-request ceiling you accept across ALL runs on this
+     ledger, including retries and uncertain or failed attempts. For 12 rows, 12 with
+     `max_retries` 0 gives up to 12 requests. It may yield fewer than 12 pairs. Do not
+     raise it just to finish the rows. Keep the same ledger, output and ceiling on resume.
+   - `budget_usd` is a second gate based on the config's character estimate. It is not a
+     proven dollar cap. It must cover the reservations of the attempts you allow, or the
+     run stops early.
+
+c. Dry-run (prints the ledger readout only; it does not count seeds or check files):
+
+       python3 runner_v2.py --config gen_config.pilot.json --dry-run
+
+d. Run (same hidden-prompt launcher, different config):
+
+       python3 -c "import getpass,os,subprocess,sys; os.environ['OCI_GENAI_API_KEY']=getpass.getpass('Oracle key (hidden): '); sys.exit(subprocess.call(['python3','runner_v2.py','--config','gen_config.pilot.json']))"
+       printf 'exit code: %s\n' "$?"
+
+e. Success, fresh full pilot: this run's `done:` line reports the planned number of pairs
+   (12), `pilot_pairs.jsonl` grew by that number, and those attempts are `completed` in the
+   ledger. On a resume, the `done:` line counts only NEW pairs from that run: check output
+   growth against that line, and the cumulative completed pair ids against the planned
+   seed set. Exit 0 alone proves neither. Never delete the ledger, reset the allowance or
+   raise the request ceiling automatically to finish missing pairs.
+
+### Rules that apply to every run
+
+- Never put the key in a file, a command line, chat or an email. Only the hidden prompt.
+- Never delete or reset a ledger. A run that stopped is resumed with the same config and
+  ledger.
+- The request count (`max_attempts`) is the only bound the runner enforces before a call.
+  Dollar figures are estimates.
+- Price caveat: `price_per_million_chars` 0.18 in the configs is NOT verified. Oracle's
+  on-demand billing doc says chat is billed per prompt plus response character
+  (https://docs.oracle.com/en-us/iaas/Content/generative-ai/pay-on-demand.htm), but it
+  does not say whether the API-key chat-completions endpoint bills the same way, and I
+  could not read the Maverick price from Oracle's pricing page. Check the price yourself.
+- Held rows (languages outside the model's documented list, off-list sources) stay held.
+  Do not remove those rules to get more rows.
+- A `*.runlock` file next to a ledger is only a lock file. Leave it alone.
+- Prefer `runner_v2.py`. `generate.py` is legacy and disabled: it refuses before any call.
+
+## Reference
+
+Older material and design notes. Nothing in this part is needed for the steps above.
+
+### OCI SDK path (signing-key profile; not the path in Start here)
 
     pip install oci
     cp gen_config.example.json gen_config.json   # set compartment_id
@@ -24,7 +155,7 @@ prices the call only after the reply returns, and builds prompts from seed
 topics instead of the pack's rendered prompts (Instinct 1051). The tested
 entry point is runner_v2.py.
 
-## Calibration (self-run, not activated)
+### Calibration (Chicago, OCI SDK; not activated)
 
 A calibration run stays unactivated until the owner says go: nothing in this
 section calls Oracle, marks any row eligible, or collects a secret. The
@@ -72,17 +203,16 @@ Not known before a first live call: the tenancy rate and the real billing
 ceiling (the 120,000-char attempt_char_cap is the runner's own reservation
 bound, not an Oracle limit), the real per-request character counts,
 throughput and 429 behavior, and which dated Oracle terms govern the tenancy.
-`price_per_million_chars` 0.18 is Oracle's public list price; the tenancy rate
-is unverified. `requests_per_minute` is a placeholder until a live rate
+`price_per_million_chars` 0.18 is NOT verified against Oracle's own price page
+or for the API-key endpoint (see Price caveat in Start here). `requests_per_minute` is a placeholder until a live rate
 check. `budget_usd` and `attempt_char_cap` are deliberately unset in the
 calibration example: the runner fails fast without them, and setting them is
 the owner's approval step, not a pre-filled number.
 
-Auth is the standard OCI SDK path (~/.oci/config, OCI_CLI_* env vars, or instance
-principals). Execution is gated on Dylan handing the OCI keys via secure link; nobody
-creates new accounts or keys.
+Auth on this path is the standard OCI SDK path (~/.oci/config, OCI_CLI_* env vars, or
+instance principals). The owner runs it; keys never go through chat or files.
 
-## What the script does
+### What the script does
 
 - One call per training pair: a prompt template turns a seed topic into one
   instruction/response pair, and the reply is parsed, validated, and appended to the JSONL.
@@ -125,10 +255,7 @@ Note: `pack/v2.1/README.md` is the producer's file, checked in byte-identical to
 Dropbox original (Instinct 0446/0447), so this limit note lives here and in
 `scan_offlist.py`'s docstring rather than inside that file.
 
-Cost math: at $0.18/M characters, $300 buys roughly 1.6 billion characters, several
-hundred million tokens of output. Embeddings run about 10x cheaper.
-
-## Bearer-token self-run (OCI Generative AI API key)
+### Bearer-token self-run: details
 
 If you authenticate with an OCI Generative AI API key (a secret token string,
 created in the Generative AI service) instead of an IAM signing-key profile,
@@ -138,26 +265,21 @@ the OpenAI-compatible Chat Completions endpoint
 https://docs.oracle.com/en-us/iaas/Content/generative-ai/chat-completions-api.htm)
 with `Authorization: Bearer <secret>`.
 
-One-request smoke test (Ashburn, Llama 4 Maverick, exactly one call, no
-retries, cumulative count bound):
+The exact smoke and pilot commands are in Start here above.
 
-    python3 runner_v2.py --config gen_config.bearer.smoke.example.json --dry-run
-    python3 -c "import getpass,os,subprocess,sys; os.environ['OCI_GENAI_API_KEY']=getpass.getpass('Oracle key (hidden): '); sys.exit(subprocess.call(['python3','runner_v2.py','--config','gen_config.bearer.smoke.example.json']))"
-
-The getpass wrapper keeps the key out of your shell history and out of every
-file. Exit codes: 0 = one pair made; 4 = the attempt failed (read the status
+The getpass launcher keeps the key out of your shell history and out of every
+file. Exit code 4 = the attempt failed (read the status
 and error fields of smoke_ledger.jsonl, those two fields only). Dollar figures
 are labelled UNVERIFIED: no Oracle doc states the billing metric of this
 endpoint, so the enforceable bound is the request count (max_attempts 1), and
-the $0.003 figure is conditional on character metering matching the price
-list's Maverick entry. The runner refuses models whose price-list unit is not
+any dollar figure is conditional on character metering and the unverified list price. The runner refuses models whose price-list unit is not
 characters (Grok/gpt-oss are token-priced, dedicated endpoints are hourly),
 refuses to send the token to any non-Oracle host, refuses redirects, and
 refuses a token containing stray CR/LF characters from a paste. Bulk
 self-run: gen_config.bearer.example.json (requires owner-set model id,
 budget_usd, attempt_char_cap, max_attempts).
 
-## Bounded parallel calls (local candidate, offline-tested)
+### Bounded parallel calls: how it works
 
 The one-request smoke configuration remains serial and unchanged. The bulk
 example opts into two worker threads with a shared one-second minimum admission
@@ -249,55 +371,7 @@ Offline checks (no Oracle access):
     python3 test_bearer.py
     python3 test_parallel.py
 
-## Parallel pilot from the prompt pack (run only after the serial smoke passes)
-
-Offline-tested only (a loopback stub, 12 seeds, 2 workers: 12 pairs, ledger all
-completed, a second run on the same ledger made no call). No live Oracle call
-has been made with this code. Dollar figures stay UNVERIFIED; the request count
-(`max_attempts`) is the enforceable bound. Needs only Python 3 (stdlib).
-
-1. Make a small language-spread seeds file. `--approve` is your own
-   acknowledgment that these rows are the ones you chose: it marks them
-   eligible and makes no call. It authorizes no one else to run them. It keeps
-   whole pack rows, skips rows the runner would hold, and sets `n_pairs` so
-   planned pairs = seeds x pairs-per-seed:
-
-       python3 make_seeds.py --pack pack/v3.1-rev3/bulk_prompts_v3.1-rev3.onestage.train.jsonl --n 12 --out seeds_pilot.jsonl --approve
-
-2. Copy `gen_config.bearer.example.json` to `gen_config.pilot.json` and set:
-   `model_id` (the exact id your Ashburn account exposes), `budget_usd`,
-   `attempt_char_cap` (120000 at max_tokens 1024), `max_attempts`, `seeds_path`
-   `seeds_pilot.jsonl`, `out_path` `pilot_pairs.jsonl`, `ledger_path`
-   `pilot_ledger.jsonl`. Keep `workers` 2 and `min_request_interval_seconds`
-   1.0 until measured.
-
-   Choose max_attempts as the total raw-request ceiling you accept across ALL
-   runs on this ledger, including retries and uncertain/failed attempts. For a
-   first 12-row pilot, choose max_attempts=12 and max_retries=0 only after the
-   one-request smoke and billing check and only if you accept up to 12
-   requests. This ceiling may yield fewer than 12 valid pairs; do not increase
-   it just to finish the rows. Keep the same ledger, output and ceiling on
-   resume. budget_usd remains a character-based estimate, not a proven dollar
-   cap.
-
-3. `python3 runner_v2.py --config gen_config.pilot.json --dry-run` prints the
-   ledger readout only. It does not count seeds and does not prove the seeds file exists.
-
-4. Run (key stays hidden; the exit code prints right after):
-
-       python3 -c "import getpass,os,subprocess,sys; os.environ['OCI_GENAI_API_KEY']=getpass.getpass('Oracle key (hidden): '); sys.exit(subprocess.call(['python3','runner_v2.py','--config','gen_config.pilot.json']))"
-       printf 'exit code: %s\n' "$?"
-
-5. For a fresh full pilot, this run's done line must report the planned number
-   of pairs, the output must grow by that number, and those attempts must be
-   completed in the ledger. On resume, the done line counts only NEW pairs from
-   that run. Check output growth against that line and cumulative completed
-   pair IDs against the planned seed/pair set. Zero exit status alone proves
-   neither full completion nor a successful new call. Never delete the ledger,
-   reset allowance or raise the request ceiling automatically to finish
-   missing pairs.
-
-## License and provenance notes
+### License and provenance notes
 
 - Oracle AI Terms (rev 2026-09-16): outputs may train other AI systems; you own your
   output. The remaining line is not attempting to reconstruct the models' training data.
@@ -308,12 +382,12 @@ has been made with this code. Dollar figures stay UNVERIFIED; the request count
 - GPU compute is blocked on this account for 90 days, so everything here rides hosted
   inference.
 
-## Storage plan
+### Storage plan
 
 Working copy in S3, mirror copy in Google Drive, mirror after each batch so a bad push
 cannot lose a day of work; GitHub carries the set only when it is ready to release.
 
-## Multi-worker safety (v2)
+### Legacy generate.py: multi-worker safety (v2)
 
 - **Claim-before-call.** A worker claims a record before its first billable call. Claims
   live in `claims/` next to the output as one small JSON file per record. A second
@@ -327,7 +401,7 @@ cannot lose a day of work; GitHub carries the set only when it is ready to relea
 - **Deterministic plans.** Model choice and template choice hash the record id (crc32,
   not Python's randomized `hash`), so parallel workers and reruns agree on the plan.
 
-## Prompts
+### Legacy generate.py: prompts
 
 `prompts.py` holds four templates; choice is deterministic per record and the weights are
 the config's `templates` list (defaults to all four):
@@ -342,14 +416,3 @@ legacy starter corpus (100 topics across 10 domains, optional language variants,
 `--langs en,id,es`, no API calls) into `seeds.jsonl` for the legacy `generate.py`.
 `make_seeds.py` is now the pack-based pilot seed picker described under "Parallel
 pilot from the prompt pack".
-
-## Smoke test path (legacy, `generate.py` is disabled: it refuses before any call)
-
-For the current path use `runner_v2.py` and the serial smoke and parallel pilot sections
-above. The block below is kept only as a record of the old flow.
-
-```
-python3 make_seeds_legacy_grid.py --out seeds.jsonl
-python3 generate.py --config gen_config.json --limit 20     # first paid calls, ~20 pairs
-python3 dedupe.py --in <out>                                # quality gate
-```
