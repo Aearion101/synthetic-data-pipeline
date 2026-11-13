@@ -162,7 +162,8 @@ def run():
     try:
         a.generate("m", "p", cfg); check("T4 500", False, "no raise")
     except RuntimeError as e:
-        check("T4 500", str(e) == "HTTP 500 from chat completions", str(e))
+        check("T4 500", str(e).startswith("HTTP 500 from chat completions [POST 127.0.0.1/"), str(e))
+        check("T4 route shown", "/20231130/actions/v1/chat/completions]" in str(e), str(e))
         check("T4 no body/prefix", TOKEN not in str(e) and TOKEN[:40] not in str(e)
               and "bad key" not in str(e), str(e))
     srv.shutdown()
@@ -590,7 +591,7 @@ def run():
     try:
         a.generate("m", "p", cfg); check("T30 long-token 500", False, "no raise")
     except RuntimeError as e:
-        check("T30 long-token 500", str(e) == "HTTP 500 from chat completions"
+        check("T30 long-token 500", str(e).startswith("HTTP 500 from chat completions [POST 127.0.0.1/")
               and TOKEN not in str(e) and PREFIX not in str(e), str(e))
     srv.shutdown()
 

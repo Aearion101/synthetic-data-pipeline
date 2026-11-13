@@ -76,7 +76,7 @@ approval yet and would be one owner-approved call, must confirm):
 - whether the owner's Ashburn-scoped key reaches the model he names (Oracle's
   availability table lists Llama 4 in Ashburn as dedicated-cluster only).
 """
-import json, os, socket, urllib.request, urllib.error
+import json, os, socket, urllib.request, urllib.error, urllib.parse
 
 # runner_common, never runner_v2: when runner_v2 runs as a script it is
 # __main__, and importing it here would load a SECOND copy whose
@@ -93,6 +93,11 @@ MAX_TOKENS_PARAMS = ("max_tokens", "max_completion_tokens")
 # usage keys with int values and these finish_reason values are retained from
 # a server reply. Everything else the server sends is dropped at the adapter.
 USAGE_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens")
+# Exact-match vocabulary for the reply's error code (names are generic OCI/OpenAI
+# style and UNVERIFIED for this service; an unlisted code is simply not shown).
+KNOWN_ERROR_CODES = frozenset({"NotAuthorizedOrNotFound", "NotFound", "Unauthorized",
+    "InvalidParameter", "TooManyRequests", "LimitExceeded", "InternalServerError",
+    "model_not_found", "invalid_api_key", "not_found"})
 FINISH_REASONS = ("stop", "length", "content_filter", "tool_calls")
 
 
@@ -200,6 +205,18 @@ class BearerAdapter:
     def _scrub(self, text):
         return text.replace(self._token, "<redacted>") if self._token in text else text
 
+    def _route(self):
+        u = urllib.parse.urlsplit(self.url)
+        return f"{u.hostname}{u.path}"
+
+    def _known_error_code(self, err):
+        try:
+            data = json.loads(err.read(4096).decode("utf-8", "replace"))
+            code = data.get("code") or (data.get("error") or {}).get("code")
+        except Exception:
+            return None
+        return code if isinstance(code, str) and code in KNOWN_ERROR_CODES else None
+
     def generate(self, model_id, prompt, cfg):
         body = {
             "model": model_id,
@@ -222,6 +239,15 @@ class BearerAdapter:
             # prefix survive (review 2026-11-11, ChatGPT/Gemini); remote content
             # is not diagnostics, so none is kept at all.
             msg = f"HTTP {e.code} from chat completions"
+            # Added 2026-11-13 after the first live smoke returned an opaque 404:
+            # LOCAL route (host + path only, no userinfo/query) and, from the
+            # reply, only an EXACT match against a fixed vocabulary. No remote
+            # text, header or free-form value is ever copied, so nothing the
+            # server echoes (a token prefix included) can reach the ledger.
+            msg += f" [POST {self._route()}]"
+            code = self._known_error_code(e)
+            if code:
+                msg += f" [error code: {code}]"
             if e.code == 429:
                 raise Throttled(msg) from None
             raise RuntimeError(msg) from None
